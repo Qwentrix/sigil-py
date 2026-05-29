@@ -216,3 +216,28 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ── Project-specific (sigil-py) ───────────────────────────────
+# OS files
+.DS_Store
+._*
+Thumbs.db
+desktop.ini
+
+# Editor/IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local env overrides (keep .env.example tracked)
+.env.local
+.env.*.local
+
+# Signing keys / secrets — never commit (ed25519 verification fixtures)
+*.pem
+*.key
+*.pfx
+*.p12
+ed25519_*
