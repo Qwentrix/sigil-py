@@ -1,158 +1,663 @@
-"""SigilClient — HTTP client to sigil-core.
+"""SigilClient — HTTP transport to sigil-core.
 
-Implements the public SDK surface defined in docs-2026/agent-governance/04-requirements-sigil.md §4.1
-and the wire protocol in docs/protocol.md.
+Implements the internal wire protocol defined in docs/protocol.md and the
+server contracts in:
+  services/sigil-core/handlers/token_handler.go
+  services/sigil-core/handlers/toolgate_handler.go
+
+Pass 1 (primitives): issue_token, preflight, log_batch.
+Pass 2 (governance): SigilTaskContext, background flusher, disk overflow,
+    kill-switch subscriber, fail-mode.
+
+Security notes:
+  - ``internal_token`` (SIGIL_SDK_TOKEN) is NEVER logged or included in
+    exception messages.
+  - biscuit tokens returned by issue_token and cached by SigilTaskContext
+    are never written to logs, overflow files, or audit events.
+  - Raw tool arguments are never sent to sigil-core; only ``args_hash``
+    (SHA-256 of the canonical JSON of the original args) is transmitted.
 """
 
 from __future__ import annotations
 
+import base64
+import json
+import logging
 import os
-from typing import Any
+import uuid
+from typing import TYPE_CHECKING
+from urllib.parse import urlparse
+
+import requests
+
+from sigil._buffer import _Flusher, _LogBuffer
+from sigil._context import _current_task
+from sigil._overflow import _OverflowWriter
+from sigil._subscriber import _RevocationSubscriber
+from sigil.errors import SigilAPIError, SigilTransportError
+from sigil.verify import VerifyResult, verify_local
+
+if TYPE_CHECKING:
+    from types import TracebackType
+    from typing import Any
+
+# Maximum number of events accepted by sigil-core per log-batch call.
+# Mirrors services.MaxAuditBatchSize in services/sigil-core/handlers/toolgate_handler.go.
+_MAX_BATCH_SIZE: int = 100
+
+_log = logging.getLogger("sigil")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Environment / keyring helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _parse_biscuit_keyring() -> dict[str, bytes]:
+    """Build the biscuit public-key keyring from environment variables.
+
+    Two env-var forms are supported:
+
+    * ``SIGIL_BISCUIT_PUBKEYS`` — JSON object ``{"kid1": "<base64_pubkey>", ...}``
+      for multi-key / rotation scenarios.
+    * ``SIGIL_BISCUIT_PUBKEY`` + ``SIGIL_BISCUIT_KID`` — single-key shorthand.
+
+    Returns:
+        ``{kid: 32-byte-pubkey-bytes}`` mapping; empty dict if no env vars set.
+    """
+    keyring: dict[str, bytes] = {}
+
+    pubkeys_json = os.environ.get("SIGIL_BISCUIT_PUBKEYS", "")
+    if pubkeys_json:
+        try:
+            raw: dict[str, str] = json.loads(pubkeys_json)
+            for kid, b64_key in raw.items():
+                keyring[kid] = base64.b64decode(b64_key)
+        except Exception:  # noqa: BLE001
+            pass  # malformed env var — caller's keyring takes precedence
+
+    single_key = os.environ.get("SIGIL_BISCUIT_PUBKEY", "")
+    single_kid = os.environ.get("SIGIL_BISCUIT_KID", "")
+    if single_key and single_kid and single_kid not in keyring:
+        try:
+            keyring[single_kid] = base64.b64decode(single_key)
+        except Exception:  # noqa: BLE001
+            pass
+
+    return keyring
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SigilTaskContext
+# ──────────────────────────────────────────────────────────────────────────────
 
 
 class SigilTaskContext:
     """Context manager for a single agent task.
 
-    Opens a task on sigil-core (``POST /internal/v1/sigil/tasks/open``) on
-    entry and closes it on exit.  Maintains the Biscuit task token for the
-    duration of the task.
+    Usage::
+
+        with client.task(["zep.search", "memory.store"], ttl_seconds=3600) as task:
+            results = search_knowledge_base("Q4 revenue")  # @instrumented_tool
+
+    On entry:
+      1. Generates a ``task_id`` (UUIDv4).
+      2. Issues a task-scoped biscuit token via ``client.issue_token``.
+      3. Runs ``verify_local`` to warm the effective tool set (if keyring is set).
+      4. Installs itself as the current task in a contextvar so decorators find it.
+
+    On exit (including on exception):
+      - Calls ``client._flusher.flush_all()`` to drain buffered audit events
+        (best-effort; exceptions are swallowed).
+      - Resets the contextvar.
+
+    The ``biscuit_token`` is deliberately NOT exposed as a public property.
+    Use ``task.task_id`` for correlation; the token stays internal.
 
     Do NOT share a ``SigilTaskContext`` across threads.  Each concurrent task
     must instantiate its own context.
-
-    Use as an async context manager via ``AsyncSigilTaskContext`` for asyncio.
     """
 
     def __init__(
         self,
-        client: "SigilClient",
-        task_type: str,
-        scope: dict[str, Any],
+        client: SigilClient,
+        tool_allowlist: list[str],
+        agent_id: str | None,
+        service_account_id: str | None,
+        ttl_seconds: int,
     ) -> None:
         self._client = client
-        self._task_type = task_type
-        self._scope = scope
-        self._task_id: str | None = None
-        self._biscuit_token: str | None = None
+        self._tool_allowlist = tool_allowlist
+        self._agent_id_override = agent_id
+        self._sa_id_override = service_account_id
+        self._ttl_seconds = ttl_seconds
 
-    def __enter__(self) -> "SigilTaskContext":
-        raise NotImplementedError("SigilTaskContext.__enter__ is not yet implemented.")
+        self._task_id: str | None = None
+        self._biscuit_token: str | None = None  # NEVER log or expose
+        self._effective_tools: list[str] = []
+        self._ctx_token: Any = None  # contextvars.Token returned by .set()
+
+    def __enter__(self) -> SigilTaskContext:
+        agent_id = self._agent_id_override or self._client.agent_id
+        sa_id = self._sa_id_override or self._client.service_account_id
+        task_id = str(uuid.uuid4())
+        self._task_id = task_id
+
+        resp = self._client.issue_token(
+            agent_id=agent_id,
+            service_account_id=sa_id,
+            task_id=task_id,
+            tool_allowlist=self._tool_allowlist,
+            ttl_seconds=self._ttl_seconds,
+        )
+        biscuit_token: str = resp["biscuit_token"]
+        self._biscuit_token = biscuit_token  # stays private
+
+        # Warm the effective tool set via local verification.
+        # If the keyring is empty we cannot verify — per-call verify_local will
+        # deny each tool call with token_invalid, which is the correct behaviour
+        # for a misconfigured SDK (no public key → closed by default).
+        if self._client.biscuit_keyring:
+            result: VerifyResult = verify_local(
+                biscuit_token,
+                self._client.biscuit_keyring,
+                active_kid=self._client.active_kid or None,
+            )
+            if result.ok:
+                self._effective_tools = result.effective_tools
+            # ok=False: effective_tools stays []; per-call verify will deny
+        else:
+            # No keyring configured — expose the requested allowlist so that
+            # callers in dev environments with mocked verify can still introspect
+            # what was requested, but per-call verify_local will deny.
+            self._effective_tools = list(self._tool_allowlist)
+
+        # Make this context visible to decorators via the contextvar.
+        self._ctx_token = _current_task.set(self)
+        return self
 
     def __exit__(
         self,
         exc_type: type[BaseException] | None,
         exc_val: BaseException | None,
-        exc_tb: object,
+        exc_tb: TracebackType | None,
     ) -> None:
-        raise NotImplementedError("SigilTaskContext.__exit__ is not yet implemented.")
+        # Best-effort flush of buffered audit events for this task.
+        try:
+            self._client._flusher.flush_all()
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Reset the contextvar regardless of whether flush succeeded.
+        if self._ctx_token is not None:
+            _current_task.reset(self._ctx_token)
+            self._ctx_token = None
 
     @property
     def task_id(self) -> str | None:
         """UUID of the open task, or None before entry."""
         return self._task_id
 
-    @property
-    def biscuit_token(self) -> str | None:
-        """Active Biscuit task token, or None before entry."""
-        return self._biscuit_token
+    # _biscuit_token is intentionally NOT exposed — it must never appear in
+    # logs, error messages, or external interfaces.
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SigilClient
+# ──────────────────────────────────────────────────────────────────────────────
 
 
 class SigilClient:
     """HTTP client for the Sigil agent governance SDK.
 
-    Thread-safe: one HTTP keep-alive connection pool per instance.
-    Not async — use ``AsyncSigilClient`` (v1.1) for asyncio workflows.
+    Thread-safe: one HTTP keep-alive connection pool (``requests.Session``)
+    per instance. Not async — use ``AsyncSigilClient`` (v1.1) for asyncio.
 
-    Required environment variables (used when constructor args are omitted):
-    - ``SIGIL_AGENT_ID``   — UUID of the registered agent.
-    - ``SIGIL_API_KEY``    — Service account credential.
-    - ``SIGIL_BASE_URL``   — sigil-core base URL, e.g. ``http://sigil-core:8120``.
-    - ``SIGIL_FAIL_MODE``  — ``"closed"`` (default) or ``"open"`` (dev only).
+    Config resolution order for each parameter: constructor arg → environment
+    variable → built-in default.
 
-    Args:
-        agent_id: UUID of the registered agent.  Defaults to ``SIGIL_AGENT_ID``.
-        api_key: Service account credential.  Defaults to ``SIGIL_API_KEY``.
-        base_url: sigil-core base URL.  Defaults to ``SIGIL_BASE_URL``.
-        fail_mode: ``"closed"`` (deny + overflow on unreachable) or
-            ``"open"`` (allow on unreachable, development only).
-            Defaults to ``SIGIL_FAIL_MODE`` or ``"closed"``.
+    Environment variables:
+
+    * ``SIGIL_CORE_URL``           — sigil-core base URL (default
+      ``http://sigil-core:8120``)
+    * ``SIGIL_SDK_TOKEN``          — internal service auth token (**required**;
+      never logged)
+    * ``SIGIL_SERVICE_ACCOUNT``    — service account label (default
+      ``"sigil-python-sdk"``)
+    * ``SIGIL_TENANT_ID``          — owning tenant UUID
+    * ``SIGIL_AGENT_ID``           — agent UUID
+    * ``SIGIL_SERVICE_ACCOUNT_ID`` — active service-account UUID
+    * ``SIGIL_FAIL_MODE``          — ``"closed"`` (default) or ``"open"``
+    * ``SIGIL_BISCUIT_PUBKEYS``    — JSON ``{"kid": "<base64_pubkey>", ...}``
+    * ``SIGIL_BISCUIT_PUBKEY`` + ``SIGIL_BISCUIT_KID`` — single-key shorthand
+    * ``SIGIL_OVERFLOW_DIR``       — override disk overflow directory
+      (default ``~/.sigil/overflow/``)
+    * ``SIGIL_REDIS_URL``          — Redis URL for kill-switch subscriber
+      (e.g. ``redis://localhost:6379/0``); subscriber disabled if unset
+
+    **fail_mode="open" warning:** If ``fail_mode="open"`` is set at construction
+    time, a ``WARNING`` is emitted immediately.  This mode is for development
+    only and must never be used in production — tool calls will be allowed even
+    when sigil-core is unreachable.
     """
 
     def __init__(
         self,
-        agent_id: str | None = None,
-        api_key: str | None = None,
+        *,
         base_url: str | None = None,
-        fail_mode: str = "closed",
+        internal_token: str | None = None,
+        service_account: str | None = None,
+        tenant_id: str | None = None,
+        agent_id: str | None = None,
+        service_account_id: str | None = None,
+        fail_mode: str | None = None,
+        biscuit_keyring: dict[str, bytes] | None = None,
+        active_kid: str | None = None,
+        timeout: float = 5.0,
+        overflow_dir: str | None = None,
     ) -> None:
-        self.agent_id: str = agent_id or os.environ.get("SIGIL_AGENT_ID", "")
-        self.api_key: str = api_key or os.environ.get("SIGIL_API_KEY", "")
         self.base_url: str = (
-            base_url or os.environ.get("SIGIL_BASE_URL", "http://sigil-core:8120")
+            base_url or os.environ.get("SIGIL_CORE_URL") or "http://sigil-core:8120"
         ).rstrip("/")
-        self.fail_mode: str = fail_mode or os.environ.get("SIGIL_FAIL_MODE", "closed")
+        # NEVER log _internal_token — it is the internalauth service credential.
+        # L2: private attribute to prevent exposure via vars()/repr.
+        self._internal_token: str = internal_token or os.environ.get("SIGIL_SDK_TOKEN") or ""
+        self.service_account: str = (
+            service_account or os.environ.get("SIGIL_SERVICE_ACCOUNT") or "sigil-python-sdk"
+        )
+        self.tenant_id: str = tenant_id or os.environ.get("SIGIL_TENANT_ID") or ""
+        self.agent_id: str = agent_id or os.environ.get("SIGIL_AGENT_ID") or ""
+        self.service_account_id: str = (
+            service_account_id or os.environ.get("SIGIL_SERVICE_ACCOUNT_ID") or ""
+        )
+        self.fail_mode: str = fail_mode or os.environ.get("SIGIL_FAIL_MODE") or "closed"
+        self.timeout: float = timeout
+        self.biscuit_keyring: dict[str, bytes] = (
+            biscuit_keyring if biscuit_keyring is not None else _parse_biscuit_keyring()
+        )
+        # F3: active_kid narrows kid-less token verification to the server's
+        # active key only, matching the server's fallback behaviour.  Without
+        # it, the SDK tries ALL keyring keys, which would accept a token signed
+        # by a rotated-out key that the server would deny.
+        self.active_kid: str = active_kid or os.environ.get("SIGIL_BISCUIT_ACTIVE_KID") or ""
 
-        if not self.agent_id:
-            raise ValueError(
-                "agent_id is required. Pass it directly or set SIGIL_AGENT_ID."
-            )
-        if not self.api_key:
-            raise ValueError(
-                "api_key is required. Pass it directly or set SIGIL_API_KEY."
-            )
         if self.fail_mode not in ("closed", "open"):
-            raise ValueError("fail_mode must be 'closed' or 'open'.")
+            raise ValueError("fail_mode must be 'closed' or 'open'")
+        if not self._internal_token:
+            raise ValueError(
+                "internal_token is required. " "Pass it directly or set SIGIL_SDK_TOKEN."
+            )
 
-    def task(self, task_type: str, scope: dict[str, Any]) -> SigilTaskContext:
-        """Return a ``SigilTaskContext`` for the given task type and scope.
+        # L2: warn when using plaintext HTTP to a non-loopback host.
+        _parsed = urlparse(self.base_url)
+        if _parsed.scheme == "http" and _parsed.hostname not in (
+            "localhost",
+            "127.0.0.1",
+        ):
+            _log.warning(
+                "sigil: base_url %r uses http:// with non-localhost host; "
+                "use https:// in production.",
+                self.base_url,
+            )
 
-        The context manager opens a task on sigil-core when entered and closes
-        it (including on exception) when exited.
+        # Loud warning for fail_mode=open — must be explicit, never the default.
+        if self.fail_mode == "open":
+            _log.warning(
+                "sigil: fail_mode='open' — tool calls will be ALLOWED when sigil-core is "
+                "unreachable. This is a DEVELOPMENT-ONLY setting. NEVER deploy in production."
+            )
+
+        self._session: requests.Session = requests.Session()
+
+        # ── Pass 2 infrastructure ─────────────────────────────────────────────
+        self._log_buffer: _LogBuffer = _LogBuffer()
+        self._overflow: _OverflowWriter = _OverflowWriter(
+            overflow_dir=overflow_dir, agent_id=self.agent_id
+        )
+        self._flusher: _Flusher = _Flusher(
+            buffer=self._log_buffer, client=self, overflow=self._overflow
+        )
+        self._flusher.start()
+
+        # Kill-switch subscriber — only if SIGIL_REDIS_URL is set.
+        redis_url = os.environ.get("SIGIL_REDIS_URL", "")
+        if redis_url and self.tenant_id:
+            self._subscriber: _RevocationSubscriber | None = _RevocationSubscriber(
+                tenant_id=self.tenant_id,
+                agent_id=self.agent_id,
+                redis_url=redis_url,
+            )
+            self._subscriber.start()
+        else:
+            self._subscriber = None
+            _log.debug(
+                "sigil: SIGIL_REDIS_URL not set or tenant_id missing — "
+                "revocation subscriber disabled"
+            )
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    def close(self) -> None:
+        """Stop background threads and do a final synchronous flush.
+
+        Safe to call multiple times (idempotent after first call).
+        """
+        if self._subscriber is not None:
+            self._subscriber.stop()
+        self._flusher.stop()
+        # Final drain — best-effort; log on failure so events aren't silently lost.
+        try:
+            self._flusher.flush_all()
+        except Exception:  # noqa: BLE001
+            _log.warning(
+                "sigil: final flush on close() raised; some events may be lost",
+                exc_info=True,
+            )
+
+    def __enter__(self) -> SigilClient:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        self.close()
+
+    # ── Revocation (used by decorators) ──────────────────────────────────────
+
+    def is_revoked(self, agent_id: str, task_id: str | None) -> bool:
+        """Return True if *agent_id* or *task_id* is in the revocation registry.
+
+        No network call — reads the in-memory cache populated by the
+        kill-switch subscriber.  Returns False if the subscriber is disabled.
+        """
+        if self._subscriber is None:
+            return False
+        return self._subscriber.is_revoked(agent_id, task_id)
+
+    # ── Internal header helpers ───────────────────────────────────────────────
+
+    def _base_headers(self) -> dict[str, str]:
+        """Headers required by every sigil-core internal route."""
+        return {
+            "X-Internal-Service-Token": self._internal_token,
+            "X-Internal-Service-Account": self.service_account,
+            "X-Tenant-ID": self.tenant_id,
+            "Content-Type": "application/json",
+        }
+
+    def _toolgate_headers(self) -> dict[str, str]:
+        """Headers for the rate-limited toolgate group (/toolgate/*).
+
+        Adds ``X-Sigil-Agent-ID`` which is REQUIRED by the rate-limiter
+        middleware on the toolgate route group.
+        """
+        h = self._base_headers()
+        if self.agent_id:
+            h["X-Sigil-Agent-ID"] = self.agent_id
+        return h
+
+    # ── Task context ──────────────────────────────────────────────────────────
+
+    def task(
+        self,
+        tool_allowlist: list[str],
+        *,
+        agent_id: str | None = None,
+        service_account_id: str | None = None,
+        ttl_seconds: int = 3600,
+    ) -> SigilTaskContext:
+        """Return a ``SigilTaskContext`` for the given tool allowlist.
+
+        The context manager issues a task-scoped biscuit token on entry and
+        flushes buffered audit events on exit (including on exception).
 
         Args:
-            task_type: Human-readable label, e.g. ``"summarize-document"``.
-            scope: Task scope dict.  At minimum ``{"tools": [...], "ttl_seconds": N}``.
+            tool_allowlist: Fully-qualified tool names the task is allowed to
+                call, e.g. ``["zep.search", "memory.store"]``.
+            agent_id: Override the client's ``agent_id`` for this task.
+                Defaults to ``self.agent_id``.
+            service_account_id: Override the client's ``service_account_id``
+                for this task.  Defaults to ``self.service_account_id``.
+            ttl_seconds: Requested biscuit token lifetime.  sigil-core clamps
+                to ``[1, 86400]``.  Defaults to 3600 (1 hour).
 
         Returns:
-            A ``SigilTaskContext`` (not yet opened).
+            A ``SigilTaskContext`` (not yet opened — use as a context manager).
         """
-        return SigilTaskContext(client=self, task_type=task_type, scope=scope)
+        return SigilTaskContext(
+            client=self,
+            tool_allowlist=tool_allowlist,
+            agent_id=agent_id,
+            service_account_id=service_account_id,
+            ttl_seconds=ttl_seconds,
+        )
+
+    # ── Pass 1 primitives ─────────────────────────────────────────────────────
+
+    def issue_token(
+        self,
+        agent_id: str,
+        service_account_id: str,
+        task_id: str,
+        tool_allowlist: list[str],
+        ttl_seconds: int,
+        attenuation_root: str | None = None,
+    ) -> dict[str, Any]:
+        """Issue a Biscuit task token via sigil-core.
+
+        ``POST {base}/internal/v1/sigil/tokens/issue``
+
+        Required headers: ``X-Internal-Service-Token``,
+        ``X-Internal-Service-Account``, ``X-Tenant-ID``.
+
+        Args:
+            agent_id: UUID of the registered agent.
+            service_account_id: UUID of the agent's active service account.
+            task_id: UUID of the task to scope the token to.
+            tool_allowlist: List of fully-qualified tool names the token
+                should grant (``["zep.search", "memory.store"]``).
+            ttl_seconds: Requested token lifetime in seconds.
+                sigil-core clamps to ``[1, 86400]``.
+            attenuation_root: Optional parent biscuit token for attenuated
+                child issuance. Never logged.
+
+        Returns:
+            dict with keys ``grant_id``, ``biscuit_token``,
+            ``revocation_id``, ``expires_at``.  **Never log biscuit_token.**
+
+        Raises:
+            :class:`~sigil.errors.SigilTransportError`: On network failure.
+            :class:`~sigil.errors.SigilAPIError`: If the server returns
+                a non-201 status code.
+        """
+        url = f"{self.base_url}/internal/v1/sigil/tokens/issue"
+        body: dict[str, Any] = {
+            "agent_id": agent_id,
+            "service_account_id": service_account_id,
+            "task_id": task_id,
+            "tool_allowlist": tool_allowlist,
+            "ttl_seconds": ttl_seconds,
+        }
+        if attenuation_root is not None:
+            body["attenuation_root"] = attenuation_root
+
+        try:
+            resp = self._session.post(
+                url,
+                headers=self._base_headers(),
+                json=body,
+                timeout=self.timeout,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise SigilTransportError(
+                "issue_token: transport error reaching sigil-core",
+                method="POST",
+                url=url,
+            ) from exc
+
+        if resp.status_code != 201:
+            raise SigilAPIError(
+                f"issue_token: expected 201, got {resp.status_code}",
+                status_code=resp.status_code,
+            )
+
+        # F2: wrap resp.json() — a 200 with a non-JSON body (WAF/nginx HTML)
+        # would raise JSONDecodeError outside the transport try/except, escaping
+        # _governance_check and dropping any audit event.  Raise SigilAPIError
+        # so it routes through the existing fail-mode path.
+        try:
+            result: dict[str, Any] = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            raise SigilAPIError(
+                f"issue_token: response body is not valid JSON (status={resp.status_code})",
+                status_code=resp.status_code,
+            ) from exc
+        return result
 
     def preflight(
         self,
-        task_id: str,
+        token: str,
+        tool_namespace: str,
         tool_name: str,
         args_hash: str,
-        args_redacted: dict[str, Any],
+        agent_id: str | None = None,
+        task_id: str | None = None,
     ) -> dict[str, Any]:
         """Send a preflight request to sigil-core and return the verdict dict.
 
-        Used internally by instrumented_tool for ``risk_tier >= high`` calls.
+        ``POST {base}/internal/v1/sigil/toolgate/preflight``
+
+        Required headers: ``X-Internal-Service-Token``,
+        ``X-Internal-Service-Account``, ``X-Tenant-ID``,
+        ``X-Sigil-Agent-ID`` (required by the rate-limited toolgate group).
 
         Args:
-            task_id: Active task UUID.
-            tool_name: Fully-qualified tool name.
-            args_hash: SHA-256 hex of canonical JSON of original args.
-            args_redacted: Redacted args dict.
+            token: Active Biscuit task token.  Never logged.
+            tool_namespace: Tool namespace, e.g. ``"zep"``.
+            tool_name: Tool name within the namespace, e.g. ``"search"``.
+            args_hash: SHA-256 hex of the canonical JSON of the original
+                (unredacted) tool arguments.
+            agent_id: Optional agent UUID to include in the request body
+                for attribution.  Falls back to ``self.agent_id``.
+            task_id: Optional task UUID to include in the request body.
 
         Returns:
-            Preflight response dict with at least a ``verdict`` key.
+            dict with ``verdict`` (``"allow"`` | ``"deny"`` | ``"approve"``),
+            optional ``denied_reason``, optional ``required_role``.
 
         Raises:
-            SigilUnreachableDeniedError: If unreachable and ``fail_mode="closed"``.
+            :class:`~sigil.errors.SigilTransportError`: On network failure.
+                Pass 2 applies fail-mode logic (closed → deny, open → allow).
+            :class:`~sigil.errors.SigilAPIError`: On unexpected HTTP status.
         """
-        raise NotImplementedError("SigilClient.preflight is not yet implemented.")
+        url = f"{self.base_url}/internal/v1/sigil/toolgate/preflight"
+        body: dict[str, Any] = {
+            "token": token,
+            "tool_namespace": tool_namespace,
+            "tool_name": tool_name,
+            "args_hash": args_hash,
+        }
+        effective_agent_id = agent_id or self.agent_id
+        if effective_agent_id:
+            body["agent_id"] = effective_agent_id
+        if task_id:
+            body["task_id"] = task_id
 
-    def log_batch(self, events: list[dict[str, Any]]) -> list[str]:
+        try:
+            resp = self._session.post(
+                url,
+                headers=self._toolgate_headers(),
+                json=body,
+                timeout=self.timeout,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise SigilTransportError(
+                "preflight: transport error reaching sigil-core",
+                method="POST",
+                url=url,
+            ) from exc
+
+        if resp.status_code != 200:
+            raise SigilAPIError(
+                f"preflight: expected 200, got {resp.status_code}",
+                status_code=resp.status_code,
+            )
+
+        # F2: wrap resp.json() so a non-JSON 200 (WAF intercept) raises
+        # SigilAPIError, keeping it in the fail-mode path.
+        try:
+            result: dict[str, Any] = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            raise SigilAPIError(
+                f"preflight: response body is not valid JSON (status={resp.status_code})",
+                status_code=resp.status_code,
+            ) from exc
+        return result
+
+    def log_batch(self, events: list[dict[str, Any]]) -> dict[str, Any]:
         """Flush a batch of audit events to sigil-core.
+
+        ``POST {base}/internal/v1/sigil/toolgate/log-batch``
+
+        Required headers: ``X-Internal-Service-Token``,
+        ``X-Internal-Service-Account``, ``X-Tenant-ID``,
+        ``X-Sigil-Agent-ID``.
 
         Args:
             events: List of event dicts (see docs/protocol.md §4.1).
+                Raw tool arguments must NOT be included — pass
+                ``args_hash`` (over original) and ``args_redacted``
+                (DLP-scrubbed copy) instead.
+                Maximum ``100`` events per call.
 
         Returns:
-            List of server-assigned invocation_ids.
+            dict with ``accepted`` (int) — number of events accepted by
+            sigil-core.
 
         Raises:
-            SigilUnreachableDeniedError: If unreachable and ``fail_mode="closed"``.
+            ValueError: If *events* contains more than 100 items.
+            :class:`~sigil.errors.SigilTransportError`: On network failure.
+            :class:`~sigil.errors.SigilAPIError`: On unexpected HTTP status.
         """
-        raise NotImplementedError("SigilClient.log_batch is not yet implemented.")
+        if len(events) > _MAX_BATCH_SIZE:
+            raise ValueError(
+                f"log_batch: batch size {len(events)} exceeds the maximum of "
+                f"{_MAX_BATCH_SIZE} events per call"
+            )
+
+        url = f"{self.base_url}/internal/v1/sigil/toolgate/log-batch"
+        body: dict[str, Any] = {"events": events}
+
+        try:
+            resp = self._session.post(
+                url,
+                headers=self._toolgate_headers(),
+                json=body,
+                timeout=self.timeout,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise SigilTransportError(
+                "log_batch: transport error reaching sigil-core",
+                method="POST",
+                url=url,
+            ) from exc
+
+        if resp.status_code != 202:
+            raise SigilAPIError(
+                f"log_batch: expected 202, got {resp.status_code}",
+                status_code=resp.status_code,
+            )
+
+        # F2: wrap resp.json() so a non-JSON 202 (proxy/CDN body) raises
+        # SigilAPIError instead of an escaping JSONDecodeError.
+        try:
+            result: dict[str, Any] = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            raise SigilAPIError(
+                f"log_batch: response body is not valid JSON (status={resp.status_code})",
+                status_code=resp.status_code,
+            ) from exc
+        return result
