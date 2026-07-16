@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "sigil-py"
 version = "0.1.0"
 description = "Micelium Sigil — Python SDK for embedding governance into AI agents."
-readme = "README.md"
+readme = { file = "README.md", content-type = "text/markdown" }
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 authors = [
