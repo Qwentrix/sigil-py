@@ -249,6 +249,35 @@ def _governance_check(
             task_id=task_id,
         )
 
+    # ── Step 2b: kill-switch health gate (fail-closed option) ─────────────────
+    # If the operator set kill_switch_fail_mode="closed", a DEGRADED subscriber
+    # (configured but not connected → revocations may be silently missed) must DENY
+    # rather than allow. Default "open" preserves prior behavior; the subscriber's own
+    # throttled WARNING + client.is_kill_switch_healthy() give visibility either way.
+    # is_kill_switch_healthy() returns True when the kill-switch is intentionally
+    # disabled, so this never fires for deployments that don't use the Redis kill-switch.
+    if client.kill_switch_fail_mode == "closed" and not client.is_kill_switch_healthy():
+        ev = _make_event(
+            agent_id,
+            task_id,
+            tool_fqn,
+            namespace,
+            ah,
+            0,
+            "denied",
+            risk_tier,
+            denied_reason="kill_switch_degraded",
+            args_redacted=args_redacted,
+        )
+        client._log_buffer.push(ev)
+        raise SigilDeniedError(
+            f"Kill-switch degraded; call to '{tool_fqn}' denied "
+            "(kill_switch_fail_mode=closed)",
+            denied_reason="kill_switch_degraded",
+            tool_name=tool_fqn,
+            task_id=task_id,
+        )
+
     # ── Step 3: local verify (<1 ms, no network) ──────────────────────────────
     biscuit_token = task._biscuit_token
     if biscuit_token is None:

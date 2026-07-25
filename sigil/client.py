@@ -251,6 +251,7 @@ class SigilClient:
         agent_id: str | None = None,
         service_account_id: str | None = None,
         fail_mode: str | None = None,
+        kill_switch_fail_mode: str | None = None,
         biscuit_keyring: dict[str, bytes] | None = None,
         active_kid: str | None = None,
         timeout: float = 5.0,
@@ -271,6 +272,14 @@ class SigilClient:
             service_account_id or os.environ.get("SIGIL_SERVICE_ACCOUNT_ID") or ""
         )
         self.fail_mode: str = fail_mode or os.environ.get("SIGIL_FAIL_MODE") or "closed"
+        # How governed calls behave when the revocation subscriber is configured but
+        # DEGRADED (can't receive kills). Default "open" = prior behavior (allow; rely on
+        # the subscriber's WARNING + is_kill_switch_healthy()). "closed" = strict posture:
+        # deny governed calls while the kill-switch cannot be guaranteed (see
+        # _governance_check in decorators.py). Independent of fail_mode (sigil-core reach).
+        self.kill_switch_fail_mode: str = (
+            kill_switch_fail_mode or os.environ.get("SIGIL_KILL_SWITCH_FAIL_MODE") or "open"
+        )
         self.timeout: float = timeout
         self.biscuit_keyring: dict[str, bytes] = (
             biscuit_keyring if biscuit_keyring is not None else _parse_biscuit_keyring()
@@ -283,6 +292,8 @@ class SigilClient:
 
         if self.fail_mode not in ("closed", "open"):
             raise ValueError("fail_mode must be 'closed' or 'open'")
+        if self.kill_switch_fail_mode not in ("closed", "open"):
+            raise ValueError("kill_switch_fail_mode must be 'closed' or 'open'")
         if not self._internal_token:
             raise ValueError(
                 "internal_token is required. " "Pass it directly or set SIGIL_SDK_TOKEN."
@@ -321,6 +332,7 @@ class SigilClient:
 
         # Kill-switch subscriber — only if SIGIL_REDIS_URL is set.
         redis_url = os.environ.get("SIGIL_REDIS_URL", "")
+        self._redis_url_configured = bool(redis_url)
         if redis_url and self.tenant_id:
             self._subscriber: _RevocationSubscriber | None = _RevocationSubscriber(
                 tenant_id=self.tenant_id,
@@ -328,11 +340,19 @@ class SigilClient:
                 redis_url=redis_url,
             )
             self._subscriber.start()
+        elif redis_url and not self.tenant_id:
+            # Fail LOUD: the operator configured a kill-switch but it cannot start (no
+            # tenant_id → no channel), so remote revocations would be silently missed.
+            self._subscriber = None
+            _log.warning(
+                "sigil: SIGIL_REDIS_URL is set but tenant_id is empty — kill-switch "
+                "subscriber NOT started; remote revocations will NOT be enforced. "
+                "Set SIGIL_TENANT_ID."
+            )
         else:
             self._subscriber = None
             _log.debug(
-                "sigil: SIGIL_REDIS_URL not set or tenant_id missing — "
-                "revocation subscriber disabled"
+                "sigil: SIGIL_REDIS_URL not set — revocation subscriber disabled (by config)"
             )
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -376,6 +396,37 @@ class SigilClient:
         if self._subscriber is None:
             return False
         return self._subscriber.is_revoked(agent_id, task_id)
+
+    def is_kill_switch_healthy(self) -> bool:
+        """True if the remote kill-switch is operational (or intentionally disabled).
+
+        Returns False ONLY for the dangerous case: SIGIL_REDIS_URL was configured (the
+        operator wants remote revocation) but the subscriber is not currently connected
+        — a kill signal would be silently missed. Surface this on your service's health
+        probe / a metric so a degraded kill-switch fails LOUD instead of open.
+        """
+        if self._subscriber is not None:
+            return self._subscriber.healthy()
+        # No subscriber: healthy only if the kill-switch was intentionally not configured.
+        return not self._redis_url_configured
+
+    def kill_switch_status(self) -> dict[str, Any]:
+        """Diagnostic snapshot of the kill-switch subscriber for health endpoints/metrics."""
+        if self._subscriber is not None:
+            return {
+                "enabled": True,
+                "healthy": self._subscriber.healthy(),
+                **self._subscriber.status(),
+            }
+        return {
+            "enabled": False,
+            "healthy": not self._redis_url_configured,
+            "detail": (
+                "SIGIL_REDIS_URL set but tenant_id missing — subscriber not started"
+                if self._redis_url_configured
+                else "revocation subscriber disabled (SIGIL_REDIS_URL not set)"
+            ),
+        }
 
     # ── Internal header helpers ───────────────────────────────────────────────
 
