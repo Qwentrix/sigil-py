@@ -23,7 +23,13 @@ kill-switched in under-1 ms overhead via the Sigil control plane.
 ## Installation
 
 ```bash
-pip install sigil-py
+# Distribution name is `qwentrix-sigil` (the public PyPI "sigil-py" is an unrelated
+# project). The import name is still `sigil`. Add the [revocation] extra to enable
+# the Redis kill-switch subscriber (required for instant remote revocation).
+#
+# NOTE: not yet published to PyPI. Until then, install from git (pin a tag or commit):
+#   pip install "qwentrix-sigil[revocation] @ git+https://github.com/Qwentrix/sigil-py.git@<tag-or-sha>"
+pip install "qwentrix-sigil[revocation]"
 ```
 
 ---

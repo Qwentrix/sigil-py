@@ -3,8 +3,13 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "sigil-py"
-version = "0.1.0"
+# Distribution name (what you `pip install`). NOTE: the public PyPI name "sigil-py"
+# is an UNRELATED third-party project, so we publish under the Qwentrix-scoped name
+# to mirror the TS SDK's "@qwentrix/sigil". The IMPORT name stays `sigil`
+# (see [tool.hatch.build.targets.wheel] packages below) — `pip install qwentrix-sigil`
+# then `import sigil`.
+name = "qwentrix-sigil"
+version = "0.2.0"
 description = "Micelium Sigil — Python SDK for embedding governance into AI agents."
 readme = { file = "README.md", content-type = "text/markdown" }
 license = { text = "Apache-2.0" }
@@ -32,7 +37,13 @@ dependencies = [
 
 [project.optional-dependencies]
 revocation = [
-    "redis>=5.0",
+    # Upper-bound is REQUIRED: redis-py 8.x changed pub/sub connection handling
+    # (CLIENT MAINT_NOTIFICATIONS / push-message routing) so the kill-switch
+    # subscriber's `pubsub().get_message()` silently receives nothing against
+    # Redis < 8 — i.e. the kill-switch fails OPEN with no error. Verified: 5.3.1
+    # works, 8.0.1 breaks. Keep pinned below 8 until _subscriber.py is updated
+    # and tested against redis-py 8.x + Redis 8.x.
+    "redis>=5,<8",
 ]
 dev = [
     "pytest>=7.4.0",
