@@ -36,6 +36,7 @@ pytestmark = pytest.mark.skipif(
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture()
 def base_url() -> str:
     return os.environ.get("SIGIL_TEST_BASE_URL", "http://localhost:8120")
@@ -69,6 +70,7 @@ def api_key() -> str:
 # Tests
 # ---------------------------------------------------------------------------
 
+
 class TestPreflightAllowed:
     """Preflight returns ``allow`` for a tool that is in scope."""
 
@@ -76,7 +78,7 @@ class TestPreflightAllowed:
         self, base_url: str, agent_id: str, task_id: str, api_key: str
     ) -> None:
         """``zep.search`` is in the test task scope — expect verdict=allow."""
-        pytest.skip("Not yet implemented — pending SigilClient.preflight()")
+        pytest.skip("Not yet implemented — pending live sigil-core fixture")
 
 
 class TestPreflightDenied:
@@ -86,13 +88,13 @@ class TestPreflightDenied:
         self, base_url: str, agent_id: str, task_id: str, api_key: str
     ) -> None:
         """``db.write`` is excluded from the test task scope — expect verdict=deny."""
-        pytest.skip("Not yet implemented — pending SigilClient.preflight()")
+        pytest.skip("Not yet implemented — pending live sigil-core fixture")
 
     def test_deny_verdict_includes_denied_reason(
         self, base_url: str, agent_id: str, task_id: str, api_key: str
     ) -> None:
         """Denial response must include a non-empty ``denied_reason`` string."""
-        pytest.skip("Not yet implemented — pending SigilClient.preflight()")
+        pytest.skip("Not yet implemented — pending live sigil-core fixture")
 
 
 class TestPreflightRevokedAgent:
@@ -112,10 +114,10 @@ class TestPreflightResponseShape:
         self, base_url: str, agent_id: str, task_id: str, api_key: str
     ) -> None:
         """Response dict must contain at least ``verdict`` key."""
-        pytest.skip("Not yet implemented — pending SigilClient.preflight()")
+        pytest.skip("Not yet implemented — pending live sigil-core fixture")
 
     def test_allow_verdict_has_null_denied_reason(
         self, base_url: str, agent_id: str, task_id: str, api_key: str
     ) -> None:
         """``denied_reason`` must be null when verdict is ``allow``."""
-        pytest.skip("Not yet implemented — pending SigilClient.preflight()")
+        pytest.skip("Not yet implemented — pending live sigil-core fixture")

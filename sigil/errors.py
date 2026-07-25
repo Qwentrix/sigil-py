@@ -33,3 +33,40 @@ class SigilUnreachableDeniedError(SigilDeniedError):
     the closed-failure policy.  Overflow events are written to
     ``~/.sigil/overflow/<agent_id>_<date>.ndjson`` for later replay.
     """
+
+
+class SigilTransportError(Exception):
+    """Raised when an HTTP call to sigil-core fails at the transport level.
+
+    This covers connection errors, timeouts, and DNS failures — situations
+    where no HTTP response was received from the server.
+
+    Pass 2 catches this exception and applies fail-mode logic:
+    ``closed`` → raise :class:`SigilUnreachableDeniedError`;
+    ``open`` → allow (development/degraded mode only).
+
+    Attributes:
+        method: HTTP method of the failed request (e.g. ``"POST"``).
+        url: Full URL of the failed request.
+    """
+
+    def __init__(self, message: str, *, method: str = "", url: str = "") -> None:
+        super().__init__(message)
+        self.method: str = method
+        self.url: str = url
+
+
+class SigilAPIError(Exception):
+    """Raised when sigil-core returns an unexpected HTTP status code.
+
+    Distinct from :class:`SigilTransportError`: the request reached the server
+    and received a response, but the status code was not the expected success
+    code.
+
+    Attributes:
+        status_code: HTTP status code returned by sigil-core.
+    """
+
+    def __init__(self, message: str, *, status_code: int = 0) -> None:
+        super().__init__(message)
+        self.status_code: int = status_code

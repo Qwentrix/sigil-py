@@ -3,10 +3,15 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "sigil-py"
-version = "0.1.0"
+# Distribution name (what you `pip install`). NOTE: the public PyPI name "sigil-py"
+# is an UNRELATED third-party project, so we publish under the Qwentrix-scoped name
+# to mirror the TS SDK's "@qwentrix/sigil". The IMPORT name stays `sigil`
+# (see [tool.hatch.build.targets.wheel] packages below) — `pip install qwentrix-sigil`
+# then `import sigil`.
+name = "qwentrix-sigil"
+version = "0.2.0"
 description = "Micelium Sigil — Python SDK for embedding governance into AI agents."
-readme = "README.md"
+readme = { file = "README.md", content-type = "text/markdown" }
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 authors = [
@@ -21,19 +26,29 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Security",
 ]
 dependencies = [
     "requests>=2.31.0",
     "PyNaCl>=1.5.0",
-    "typing-extensions>=4.9.0",
 ]
 
 [project.optional-dependencies]
+revocation = [
+    # Upper-bound is REQUIRED: redis-py 8.x changed pub/sub connection handling
+    # (CLIENT MAINT_NOTIFICATIONS / push-message routing) so the kill-switch
+    # subscriber's `pubsub().get_message()` silently receives nothing against
+    # Redis < 8 — i.e. the kill-switch fails OPEN with no error. Verified: 5.3.1
+    # works, 8.0.1 breaks. Keep pinned below 8 until _subscriber.py is updated
+    # and tested against redis-py 8.x + Redis 8.x.
+    "redis>=5,<8",
+]
 dev = [
     "pytest>=7.4.0",
     "pytest-cov>=4.1.0",
+    "pytest-asyncio>=0.23.0",
     "ruff>=0.3.0",
     "mypy>=1.9.0",
     "types-requests>=2.31.0",
@@ -55,6 +70,13 @@ packages = ["sigil"]
 # ---------------------------------------------------------------------------
 # Ruff
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Black
+# ---------------------------------------------------------------------------
+[tool.black]
+target-version = ["py310", "py311", "py312", "py313"]
+line-length = 100
+
 [tool.ruff]
 target-version = "py310"
 line-length = 100
@@ -73,9 +95,13 @@ select = [
     "ANN", # flake8-annotations
 ]
 ignore = [
-    "ANN101",  # missing type annotation for 'self' in method
-    "ANN102",  # missing type annotation for 'cls' in classmethod
+    "ANN401",  # Dynamically typed expressions (typing.Any) — justified for DLP/decode public APIs
+    "BLE001",  # Do not catch blind exception — intentional in transport/parsing error handlers
+    "SIM105",  # contextlib.suppress — try/except/pass is clearer in env-var parsing fallbacks
 ]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["ANN", "S101"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["sigil"]
@@ -93,9 +119,14 @@ disallow_any_generics = true
 no_implicit_reexport = true
 show_error_codes = true
 
+[[tool.mypy.overrides]]
+module = ["redis"]
+ignore_missing_imports = true
+
 # ---------------------------------------------------------------------------
 # Pytest
 # ---------------------------------------------------------------------------
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--cov=sigil --cov-report=term-missing --cov-fail-under=80 -v"
+addopts = "--cov=sigil --cov-report=term-missing --cov-fail-under=85 -v"
+asyncio_mode = "auto"
