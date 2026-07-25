@@ -9,7 +9,14 @@
 
 The Sigil wire protocol defines the HTTP exchange between SDK clients and `sigil-core`. All calls are over HTTPS in production (plaintext HTTP acceptable on localhost/loopback only). All request/response bodies are `application/json`.
 
-Authentication on internal routes uses `X-Internal-Secret` (shared secret from `INTERNAL_API_SECRET` env var) plus `X-Sigil-Agent-Token` (Biscuit task token) for SDK-originated calls.
+Authentication on internal routes uses four headers (see §3 and §4 for which apply where):
+
+| Header | Description |
+|---|---|
+| `X-Internal-Service-Token` | Shared secret from `SIGIL_SDK_TOKEN` env var (internalauth credential) |
+| `X-Internal-Service-Account` | Service account name string (e.g. `"sigil-agent-sa"`) |
+| `X-Tenant-ID` | Tenant UUID |
+| `X-Sigil-Agent-ID` | Agent UUID (required by the rate-limited toolgate group) |
 
 ---
 
@@ -19,50 +26,55 @@ Sigil uses a **homegrown JSON + ed25519 capability token** format (not an extern
 
 ### 2.1 Structure
 
-A token is a base64url-encoded concatenation of two components:
+A token is two base64url-encoded components separated by `.`:
 
 ```
-<authority_block_b64url>.<signature_b64url>
+<payload_b64url>.<signature_b64url>
 ```
 
-Where `<authority_block_b64url>` is a base64url-encoded JSON object:
+Where `<payload_b64url>` is a base64url-encoded JSON object:
 
 ```json
 {
-  "version": 1,
-  "identity_type": "agent",
-  "agent_id": "<uuid>",
-  "task_id": "<uuid>",
-  "tenant_id": "<uuid>",
-  "facts": [
-    "tool(\"zep.search\")",
-    "tool(\"skovo.fetch\")",
-    "task(\"<task_id_uuid>\")",
-    "agent(\"<agent_id_uuid>\")"
-  ],
-  "issued_at": "<ISO-8601>",
-  "expires_at": "<ISO-8601>",
-  "revocation_id": "<uuid>"
+  "v": 1,
+  "kid": "<key-id>",
+  "blocks": [
+    {
+      "facts": [
+        "tool(\"zep.search\")",
+        "tool(\"skovo.fetch\")",
+        "tenant(\"<tenant_uuid>\")",
+        "agent(\"<agent_uuid>\")",
+        "task(\"<task_id_uuid>\")"
+      ],
+      "checks": ["check if time($t), $t < \"<ISO-8601-expiry>\""],
+      "rid": "<revocation_id>",
+      "idx": 0
+    }
+  ]
 }
 ```
 
-Facts use a `predicate("value")` string encoding. Each allowed tool produces one `tool(...)` fact with a `namespace.name` string.
+Facts use a `predicate("value")` string encoding. Each allowed tool produces one `tool(...)` fact with a `namespace.name` string. The `tenant(...)`, `agent(...)`, and `task(...)` facts bind the token to a specific execution context.
 
 ### 2.2 Signature
 
-The authority block bytes are signed with **ed25519** using the drm-service's root signing key. The public key is distributed to SDKs at credential bootstrap time (service account provisioning response) and rotated quarterly. SDKs cache the public key in memory for the token lifetime.
+The payload bytes are signed with **ed25519** using the drm-service's root signing key identified by `kid`. The public key is distributed to SDKs at credential bootstrap time (service account provisioning response) and rotated quarterly. SDKs cache the public key in memory for the token lifetime.
 
-Verification uses `pynacl` (Python) or `tweetnacl` (TypeScript/Node.js) — both implement the same ed25519 signing primitive with compatible wire representations.
+Verification uses `pynacl` (Python) or `tweetnacl` (TypeScript/Node.js).
 
 ### 2.3 Verification Steps (SDK local check)
 
-1. Split token on `.` into `[authority_b64, sig_b64]`.
+1. Split token on `.` into `[payload_b64, sig_b64]`.
 2. base64url-decode both parts.
-3. `nacl.signing.VerifyKey(public_key_bytes).verify(authority_bytes, sig_bytes)` — raises if invalid.
-4. Parse authority JSON.
-5. Check `expires_at > now`. If expired, treat as deny and fire a preflight to sigil-core.
-6. For a tool call check: confirm `"tool(\"<namespace>.<name>\")"` is present in `facts`.
-7. Check `revocation_id` against local revocation cache (populated by Redis pub/sub on `drm:revocation-events`). If found in cache, deny immediately.
+3. Read `kid` from the decoded payload JSON.
+4. If `kid` is non-empty, look up the key in the SDK keyring by `kid`. If not found, reject.
+   If `kid` is empty (Go server activeID fallback), try all keys in the keyring; accept if any verifies.
+5. `nacl.signing.VerifyKey(key_bytes).verify(payload_bytes, sig_bytes)` — raises `BadSignatureError` if invalid.
+6. Parse payload JSON; iterate `blocks[0].facts`.
+7. Check the time `check` expression. If expired, treat as deny.
+8. For a tool call check: confirm `"tool(\"<namespace>.<name>\")"` is present in `facts`.
+9. Check `blocks[0].rid` against the local revocation cache. If found, deny immediately.
 
 Local verification is used for all `risk_tier=low` tool calls not in the freshness probe cycle (every 10 calls). `risk_tier >= high` always triggers a preflight HTTP call to sigil-core regardless of local verify result.
 
@@ -72,7 +84,7 @@ Local verification is used for all `risk_tier=low` tool calls not in the freshne
 
 **Endpoint:** `POST /internal/v1/sigil/toolgate/preflight`
 
-**Auth headers:** `X-Internal-Secret: <INTERNAL_API_SECRET>`, `X-Sigil-Agent-Token: <biscuit_token>`
+**Required headers:** `X-Internal-Service-Token`, `X-Internal-Service-Account`, `X-Tenant-ID`, `X-Sigil-Agent-ID`
 
 ### 3.1 Request
 
@@ -80,7 +92,8 @@ Local verification is used for all `risk_tier=low` tool calls not in the freshne
 {
   "agent_id": "<uuid>",
   "task_id": "<uuid>",
-  "tool_name": "<namespace>.<name>",
+  "tool_namespace": "<namespace>",
+  "tool_name": "<name>",
   "args_hash": "<sha256hex of canonical JSON of unredacted args>",
   "args_redacted": {
     "<key>": "<value or PII-redacted placeholder>"
@@ -88,15 +101,17 @@ Local verification is used for all `risk_tier=low` tool calls not in the freshne
 }
 ```
 
+`tool_namespace` and `tool_name` are sent as **separate fields** (not combined). The combined FQN `<namespace>.<name>` is used only within SDK internals.
+
 `args_hash` is SHA-256 of the canonical JSON (keys sorted, no extra whitespace) of the **original unredacted args**. The hash proves integrity without logging sensitive data.
 
-`args_redacted` contains the same keys as the original args, with values replaced by DLP classifier labels (e.g., `"<PII:PERSON_NAME>"`, `"<PHI:SSN>"`) when a classifier fires. Non-sensitive values pass through unchanged.
+`args_redacted` contains the same keys as the original args, with string values replaced by DLP classifier labels when a classifier fires (e.g., `"<PII:SSN>"`, `"<PII:EMAIL>"`, `"<PII:IP_ADDRESS>"`). Non-sensitive values pass through unchanged.
 
 ### 3.2 Response
 
 ```json
 {
-  "verdict": "allow" | "deny" | "pending_approval",
+  "verdict": "allow" | "deny" | "approve",
   "denied_reason": "<string or null>",
   "approval_id": "<uuid or null>",
   "latency_budget_ms": "<int or null>"
@@ -107,8 +122,15 @@ Local verification is used for all `risk_tier=low` tool calls not in the freshne
 |---|---|
 | `verdict` | Always |
 | `denied_reason` | When `verdict == "deny"`. Values: `tool_not_in_scope`, `task_expired`, `agent_revoked`, `token_invalid`, `approval_service_unavailable`, `policy_deny` |
-| `approval_id` | When `verdict == "pending_approval"` (v2 only; v1 always returns `allow` or `deny`) |
-| `latency_budget_ms` | When `verdict == "pending_approval"`: milliseconds SDK should wait before timing out |
+| `approval_id` | When `verdict == "approve"` (v2 only; v1 sigil-core always returns `allow` or `deny`) |
+| `latency_budget_ms` | When `verdict == "approve"`: milliseconds SDK should wait before timing out |
+
+**SDK verdict handling:**
+
+- `"allow"` → proceed with execution.
+- `"deny"` → raise `SigilDeniedError` with `denied_reason` from response.
+- `"approve"` → approval gates are v2 only; v1 SDK treats `approve` as `deny` with reason `approval_service_unavailable`.
+- `null`, `""`, or any other value → SDK treats as `"deny"` (fail-closed).
 
 P99 target: **20 ms** (sigil-core performs local token verify + one Redis read for revocation check).
 
@@ -120,7 +142,7 @@ P99 target: **20 ms** (sigil-core performs local token verify + one Redis read f
 
 **Endpoint:** `POST /internal/v1/sigil/toolgate/log-batch`
 
-**Auth headers:** same as preflight.
+**Required headers:** `X-Internal-Service-Token`, `X-Internal-Service-Account`, `X-Tenant-ID`, `X-Sigil-Agent-ID`
 
 **Request:**
 
@@ -134,16 +156,17 @@ P99 target: **20 ms** (sigil-core performs local token verify + one Redis read f
       "tool_namespace": "<namespace>",
       "args_hash": "<sha256hex>",
       "args_redacted": { "<key>": "<value>" },
-      "result_hash": "<sha256hex of canonical JSON of tool return value>",
-      "result_sampled": { "<key>": "<value>" },
       "latency_ms": "<int>",
-      "outcome": "allowed" | "denied",
+      "outcome": "allowed" | "denied" | "error",
       "denied_reason": "<string or null>",
-      "risk_tier": "low" | "med" | "high" | "critical"
+      "risk_tier": "low" | "med" | "high" | "critical",
+      "fail_open": "<bool — present and true only when fail_mode=open overrode a sigil-core unreachable error>"
     }
   ]
 }
 ```
+
+> **Not yet implemented by SDK v0.1:** `result_hash` and `result_sampled` fields are reserved for a future release. The SDK does not populate them; sigil-core ignores absent fields.
 
 Max **100 events** per batch. SDK flushes every 500 ms or 50 events, whichever comes first.
 
@@ -151,11 +174,11 @@ Max **100 events** per batch. SDK flushes every 500 ms or 50 events, whichever c
 
 ```json
 {
-  "invocation_ids": ["<uuid>", "..."]
+  "accepted": 12
 }
 ```
 
-Synthetic UUIDv7 ids assigned server-side. sigil-core XADDs to `sigil:writes` Redis Stream and ACKs immediately; a `sigil-writer` goroutine pool drains to PostgreSQL via COPY. P99 ACK target: **50 ms**.
+`accepted` is the integer count of events accepted by sigil-core. sigil-core XADDs to `sigil:writes` Redis Stream and ACKs immediately; a `sigil-writer` goroutine pool drains to PostgreSQL via COPY. P99 ACK target: **50 ms**.
 
 ### 4.2 Security Events Stream Payload
 
@@ -168,7 +191,7 @@ sigil-core also XADDs to `security-events:agent` Redis Stream after each logged 
   "agent_id": "<uuid>",
   "task_id": "<uuid>",
   "tool_name": "<namespace>.<name>",
-  "outcome": "allowed" | "denied",
+  "outcome": "allowed" | "denied" | "error",
   "risk_tier": "low" | "med" | "high" | "critical",
   "latency_ms": "<int>",
   "occurred_at": "<ISO-8601>",
@@ -189,7 +212,9 @@ sigil-core also XADDs to `security-events:agent` Redis Stream after each logged 
 
 ### 5.2 SDK Revocation Cache
 
-The in-memory revocation cache maps `revocation_id -> revoked_at`. Cache is warmed at SDK startup (HTTP GET to sigil-core to pull current revocations for the agent). On cache hit during local verify, the SDK immediately raises `SigilDeniedError(denied_reason="agent_revoked")` without calling sigil-core.
+The in-memory revocation cache maps `revocation_id -> revoked_at`. Cache is warmed at SDK startup (HTTP GET to sigil-core to pull current revocations for the agent). On cache hit during local verify, the SDK immediately raises `SigilDeniedError(denied_reason="agent_revoked")` without calling sigil-core. Cache is bounded at 10 000 entries (FIFO eviction).
+
+**Tenant guard:** The SDK applies revocation events only when `tenant_id` in the event matches the client's own tenant, or when `tenant_id` is absent (backward compatibility with pre-tenant-field messages). Cross-tenant revocation events are silently ignored.
 
 ### 5.3 Fail-Closed on Revocation
 
