@@ -202,9 +202,47 @@ def _handle_preflight_unreachable(
 _APPROVAL_TERMINAL: frozenset[str] = frozenset({"approved", "rejected", "expired"})
 
 
+def _approval_poll_once(
+    client: SigilClient, approval_id: str, deadline: float
+) -> tuple[str | None, float]:
+    """One iteration of the approval poll, performing NO sleeping.
+
+    Returns ``(result, sleep_seconds)``:
+
+    * ``result`` — a terminal outcome (``"approved"`` / ``"rejected"`` /
+      ``"expired"`` / ``"timeout"`` / ``"unavailable"``) when polling should stop,
+      otherwise ``None`` to keep waiting.
+    * ``sleep_seconds`` — how long to wait before the next iteration (only
+      meaningful when ``result is None``). Capped to the time remaining before
+      *deadline* so a ``poll_interval`` larger than the remaining window cannot push
+      the actual wait past ``approval_timeout`` (#307).
+
+    Isolating a single blocking ``approval_status`` call lets the native-async
+    poller offload *only that call* to a thread and ``await asyncio.sleep`` between
+    iterations, instead of pinning an executor thread for the whole approval window
+    (#311). ``deadline`` uses ``time.monotonic()`` (process-wide), so it stays
+    consistent whether this runs on the event loop or in an executor thread.
+    """
+    try:
+        status = client.approval_status(approval_id)
+    except Exception:  # noqa: BLE001
+        # Do NOT apply fail_mode here — an approval-gated call must never proceed
+        # ungoverned when the decision cannot be confirmed. ANY error (transport,
+        # API, or unexpected) fails closed.
+        return "unavailable", 0.0
+    if status in _APPROVAL_TERMINAL:
+        return status, 0.0
+    # "pending" (or an unrecognised non-terminal value) — keep waiting.
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return "timeout", 0.0
+    return None, min(client.approval_poll_interval, remaining)
+
+
 def _poll_approval(client: SigilClient, approval_id: str) -> str:
     """Block-poll a pending ENT-81 approval until it resolves, times out, or the
-    status endpoint becomes unreachable.
+    status endpoint becomes unreachable. Synchronous — used by the blocking
+    wrappers; see :func:`_poll_approval_async` for the native-async variant.
 
     Returns one of:
       - ``"approved"``    — a sigil_approver approved; the caller may proceed.
@@ -220,22 +258,34 @@ def _poll_approval(client: SigilClient, approval_id: str) -> str:
     """
     deadline = time.monotonic() + client.approval_timeout
     while True:
-        try:
-            status = client.approval_status(approval_id)
-        except Exception:  # noqa: BLE001
-            # Do NOT apply fail_mode here — an approval-gated call must never proceed
-            # ungoverned when the decision cannot be confirmed. ANY error (transport,
-            # API, or unexpected) fails closed.
-            return "unavailable"
-        if status in _APPROVAL_TERMINAL:
-            return status
-        # "pending" (or an unrecognised non-terminal value) — keep waiting.
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return "timeout"
-        # Cap the sleep to the time left so a poll_interval larger than the remaining
-        # window cannot push the actual wait past approval_timeout.
-        time.sleep(min(client.approval_poll_interval, remaining))
+        result, sleep_for = _approval_poll_once(client, approval_id, deadline)
+        if result is not None:
+            return result
+        time.sleep(sleep_for)
+
+
+async def _poll_approval_async(client: SigilClient, approval_id: str) -> str:
+    """Native-async variant of :func:`_poll_approval` for ``async def`` tools (#311).
+
+    Offloads only the individual blocking ``approval_status`` HTTP call to the
+    default executor (each is a single short round-trip) and ``await``s
+    ``asyncio.sleep`` between polls. The executor thread is therefore held only for
+    the brief status call, never for the (up to ``approval_timeout``, default 300s)
+    idle wait — so a burst of concurrently-awaiting approvals cannot exhaust the
+    thread pool the way offloading the whole blocking poll loop to a thread did.
+
+    Returns the same outcome vocabulary as :func:`_poll_approval`; every
+    non-``approved`` outcome is a FAIL-CLOSED denial at the call site.
+    """
+    deadline = time.monotonic() + client.approval_timeout
+    loop = asyncio.get_running_loop()
+    while True:
+        result, sleep_for = await loop.run_in_executor(
+            None, _approval_poll_once, client, approval_id, deadline
+        )
+        if result is not None:
+            return result
+        await asyncio.sleep(sleep_for)
 
 
 def _governance_check(
@@ -249,7 +299,7 @@ def _governance_check(
     agent_id: str,
     task_id: str,
     args_redacted: Any,
-) -> bool:
+) -> tuple[bool, str | None]:
     """Run governance steps 2-4 shared by sync and async wrappers.
 
     Steps executed:
@@ -259,8 +309,15 @@ def _governance_check(
     4. **Preflight** — HTTP call to sigil-core for high/critical risk only.
 
     Returns:
-        ``fail_open`` flag — ``True`` only when sigil-core is unreachable and
-        ``fail_mode="open"``.  Always ``False`` for low/med risk.
+        ``(fail_open, approval_id)``:
+
+        * ``fail_open`` — ``True`` only when sigil-core is unreachable and
+          ``fail_mode="open"``.  Always ``False`` for low/med risk.
+        * ``approval_id`` — non-``None`` only when preflight returned an ``approve``
+          verdict (ENT-81): the caller MUST poll that approval (``_poll_approval`` /
+          ``_poll_approval_async``) and pass the outcome to
+          :func:`_finalize_approval`.  The poll is deliberately NOT done here so the
+          async path does not pin an executor thread for the approval window (#311).
 
     Raises:
         SigilDeniedError: On revocation, local verify denial, preflight deny,
@@ -420,34 +477,14 @@ def _governance_check(
                         tool_name=tool_fqn,
                         task_id=task_id,
                     )
-                outcome = _poll_approval(client, str(approval_id))
-                if outcome != "approved":
-                    reason = {
-                        "rejected": "approval_rejected",
-                        "expired": "approval_expired",
-                        "timeout": "approval_timeout",
-                        "unavailable": "approval_service_unavailable",
-                    }[outcome]
-                    ev = _make_event(
-                        agent_id,
-                        task_id,
-                        tool_fqn,
-                        namespace,
-                        ah,
-                        0,
-                        "denied",
-                        risk_tier,
-                        denied_reason=reason,
-                        args_redacted=args_redacted,
-                    )
-                    client._log_buffer.push(ev)
-                    raise SigilDeniedError(
-                        f"Approval for '{tool_fqn}' resolved to {reason}",
-                        denied_reason=reason,
-                        tool_name=tool_fqn,
-                        task_id=task_id,
-                    )
-                # outcome == "approved": fall through to execute.
+                # Do NOT poll here: on the async path this function runs inside an
+                # executor thread (I-1), so a blocking poll of up to approval_timeout
+                # (300s) would pin that thread (#311). Signal "approval pending" to the
+                # caller, which polls with the correct primitive — blocking
+                # _poll_approval or native-async _poll_approval_async — and turns the
+                # outcome into a fall-through or a fail-closed denial via
+                # _finalize_approval.
+                return False, str(approval_id)
             elif v != "allow":
                 # Unknown verdict (e.g. null, "", "ALLOW") — fail closed.
                 ev = _make_event(
@@ -486,7 +523,61 @@ def _governance_check(
             )
             # fail_open=True → continue to execute
 
-    return fail_open
+    return fail_open, None
+
+
+def _finalize_approval(
+    client: SigilClient,
+    outcome: str,
+    *,
+    agent_id: str,
+    task_id: str,
+    tool_fqn: str,
+    namespace: str,
+    ah: str,
+    risk_tier: str,
+    args_redacted: Any,
+) -> None:
+    """Turn an approval poll *outcome* into a fall-through or a FAIL-CLOSED denial.
+
+    Extracted from the preflight approve-branch so the sync and async wrappers can
+    each supply the poll result from their own poll implementation (blocking
+    :func:`_poll_approval` vs. native-async :func:`_poll_approval_async`) while
+    sharing identical denial-event + exception handling (#311).
+
+    Returns normally on ``"approved"`` (the caller proceeds to execute). Every other
+    outcome pushes a ``denied`` audit event and raises :class:`SigilDeniedError`.
+    """
+    if outcome == "approved":
+        return
+    # Any non-approved outcome denies. .get() with a fail-closed default guards against
+    # an unexpected outcome string ever surfacing a raw KeyError instead of a clean
+    # SigilDeniedError (defensive — the poll helpers only emit the four keys below).
+    reason = {
+        "rejected": "approval_rejected",
+        "expired": "approval_expired",
+        "timeout": "approval_timeout",
+        "unavailable": "approval_service_unavailable",
+    }.get(outcome, "approval_service_unavailable")
+    ev = _make_event(
+        agent_id,
+        task_id,
+        tool_fqn,
+        namespace,
+        ah,
+        0,
+        "denied",
+        risk_tier,
+        denied_reason=reason,
+        args_redacted=args_redacted,
+    )
+    client._log_buffer.push(ev)
+    raise SigilDeniedError(
+        f"Approval for '{tool_fqn}' resolved to {reason}",
+        denied_reason=reason,
+        tool_name=tool_fqn,
+        task_id=task_id,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -650,7 +741,7 @@ def instrumented_tool(
                 # run_in_executor prevents stalling the event loop.  Exceptions
                 # raised inside _governance_check propagate correctly out of the
                 # awaited future.
-                fail_open: bool = await asyncio.get_running_loop().run_in_executor(
+                fail_open, approval_id = await asyncio.get_running_loop().run_in_executor(
                     None,
                     functools.partial(
                         _governance_check,
@@ -666,6 +757,24 @@ def instrumented_tool(
                         None,  # args_redacted
                     ),
                 )
+
+                # ENT-81 (#311): "approve" verdict → poll the approval NATIVELY async.
+                # Only the individual status calls are offloaded per-poll; the idle waits
+                # run on the event loop, so no executor thread is pinned for the (up to
+                # 300s) approval window.
+                if approval_id is not None:
+                    outcome = await _poll_approval_async(client, approval_id)
+                    _finalize_approval(
+                        client,
+                        outcome,
+                        agent_id=agent_id,
+                        task_id=task_id,
+                        tool_fqn=tool_fqn,
+                        namespace=namespace,
+                        ah=ah,
+                        risk_tier=risk_tier,
+                        args_redacted=None,
+                    )
 
                 # ── Steps 5-6: execute + audit (I-3: one-liner via helper) ────
                 return await _async_execute_audit(
@@ -697,7 +806,7 @@ def instrumented_tool(
             ah = args_hash(raw)
 
             # ── Steps 2-4: governance (shared helper) ─────────────────────────
-            fail_open = _governance_check(
+            fail_open, approval_id = _governance_check(
                 task,
                 client,
                 tool_fqn,
@@ -709,6 +818,22 @@ def instrumented_tool(
                 task_id,
                 None,  # args_redacted
             )
+
+            # ENT-81 (#311): "approve" verdict → block-poll the approval (sync path).
+            # _finalize_approval turns the outcome into a fall-through or fail-closed deny.
+            if approval_id is not None:
+                outcome = _poll_approval(client, approval_id)
+                _finalize_approval(
+                    client,
+                    outcome,
+                    agent_id=agent_id,
+                    task_id=task_id,
+                    tool_fqn=tool_fqn,
+                    namespace=namespace,
+                    ah=ah,
+                    risk_tier=risk_tier,
+                    args_redacted=None,
+                )
 
             # ── Steps 5-6: execute + audit (I-3: one-liner via helper) ────────
             return _execute_audit(
@@ -793,7 +918,7 @@ def instrumented_llm(
                 redacted = redact_safe(raw)  # DLP-scrubbed copy for audit log
 
                 # ── Steps 2-4: governance offloaded to thread (I-1) ───────────
-                fail_open: bool = await asyncio.get_running_loop().run_in_executor(
+                fail_open, approval_id = await asyncio.get_running_loop().run_in_executor(
                     None,
                     functools.partial(
                         _governance_check,
@@ -809,6 +934,24 @@ def instrumented_llm(
                         redacted,  # args_redacted
                     ),
                 )
+
+                # ENT-81 (#311): "approve" verdict → poll the approval NATIVELY async.
+                # Only the individual status calls are offloaded per-poll; the idle waits
+                # run on the event loop, so no executor thread is pinned for the (up to
+                # 300s) approval window.
+                if approval_id is not None:
+                    outcome = await _poll_approval_async(client, approval_id)
+                    _finalize_approval(
+                        client,
+                        outcome,
+                        agent_id=agent_id,
+                        task_id=task_id,
+                        tool_fqn=tool_fqn,
+                        namespace=namespace,
+                        ah=ah,
+                        risk_tier=risk_tier,
+                        args_redacted=redacted,
+                    )
 
                 # ── Steps 5-6: execute + audit (I-3: one-liner via helper) ────
                 return await _async_execute_audit(
@@ -841,7 +984,7 @@ def instrumented_llm(
             redacted = redact_safe(raw)  # DLP-scrubbed copy for audit log
 
             # ── Steps 2-4: governance (shared helper) ─────────────────────────
-            fail_open = _governance_check(
+            fail_open, approval_id = _governance_check(
                 task,
                 client,
                 tool_fqn,
@@ -853,6 +996,22 @@ def instrumented_llm(
                 task_id,
                 redacted,  # args_redacted
             )
+
+            # ENT-81 (#311): "approve" verdict → block-poll the approval (sync path).
+            # _finalize_approval turns the outcome into a fall-through or fail-closed deny.
+            if approval_id is not None:
+                outcome = _poll_approval(client, approval_id)
+                _finalize_approval(
+                    client,
+                    outcome,
+                    agent_id=agent_id,
+                    task_id=task_id,
+                    tool_fqn=tool_fqn,
+                    namespace=namespace,
+                    ah=ah,
+                    risk_tier=risk_tier,
+                    args_redacted=redacted,
+                )
 
             # ── Steps 5-6: execute + audit (I-3: one-liner via helper) ────────
             return _execute_audit(

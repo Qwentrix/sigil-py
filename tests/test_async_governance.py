@@ -15,7 +15,7 @@ import base64
 import inspect
 import json
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from nacl.signing import SigningKey
@@ -577,5 +577,78 @@ class TestAsyncApprovalGate:
                 with pytest.raises(SigilDeniedError) as exc:
                     await danger()
                 assert exc.value.denied_reason == "approval_rejected"
+        finally:
+            client.close()
+
+    async def test_async_approve_polls_natively_via_asyncio_sleep(
+        self, sk: SigningKey, tmp_path: Any
+    ) -> None:
+        """#311: the async approve path waits with ``asyncio.sleep`` on the event loop
+        (native async) between polls and never calls the blocking ``time.sleep`` — so
+        the (up to approval_timeout) idle wait cannot pin an executor-pool thread.
+        """
+        client, biscuit = self._client(sk, tmp_path)
+
+        @instrumented_tool("ns", "danger", risk_tier="high")
+        async def danger() -> str:
+            return "ok"
+
+        # pending first, approved second → forces exactly one inter-poll wait.
+        try:
+            with (
+                patch.object(
+                    client._session, "post", return_value=_mock_response(201, _issue_resp(biscuit))
+                ),
+                patch.object(
+                    client, "preflight", return_value={"verdict": "approve", "approval_id": "ap-1"}
+                ),
+                patch.object(client, "approval_status", side_effect=["pending", "approved"]),
+                patch.object(client, "log_batch", return_value={"accepted": 1}),
+                patch("sigil.decorators.asyncio.sleep", new=AsyncMock()) as mock_asleep,
+                patch("sigil.decorators.time.sleep") as mock_tsleep,
+                client.task(["ns.danger"]),
+            ):
+                assert await danger() == "ok"
+
+            # The inter-poll wait was awaited on the loop at the configured interval …
+            assert any(
+                call.args == (client.approval_poll_interval,)
+                for call in mock_asleep.await_args_list
+            ), (
+                f"expected an awaited asyncio.sleep({client.approval_poll_interval}); "
+                f"got {mock_asleep.await_args_list}"
+            )
+            # … and the blocking time.sleep was never used on the async path (#311).
+            mock_tsleep.assert_not_called()
+        finally:
+            client.close()
+
+    async def test_async_approve_timeout_denies_via_native_poll(
+        self, sk: SigningKey, tmp_path: Any
+    ) -> None:
+        """#311: a never-resolving approval on the async path fails closed with
+        ``approval_timeout`` once the local ``approval_timeout`` deadline elapses,
+        driven entirely by the native-async poller."""
+        client, biscuit = self._client(sk, tmp_path)
+
+        @instrumented_tool("ns", "danger", risk_tier="high")
+        async def danger() -> str:
+            return "ok"
+
+        try:
+            with (
+                patch.object(
+                    client._session, "post", return_value=_mock_response(201, _issue_resp(biscuit))
+                ),
+                patch.object(
+                    client, "preflight", return_value={"verdict": "approve", "approval_id": "ap-1"}
+                ),
+                patch.object(client, "approval_status", return_value="pending"),
+                patch.object(client, "log_batch", return_value={"accepted": 1}),
+                client.task(["ns.danger"]),
+            ):
+                with pytest.raises(SigilDeniedError) as exc:
+                    await danger()
+                assert exc.value.denied_reason == "approval_timeout"
         finally:
             client.close()
