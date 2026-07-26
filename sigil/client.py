@@ -23,10 +23,11 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import math
 import os
 import uuid
 from typing import TYPE_CHECKING
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import requests
 
@@ -255,6 +256,8 @@ class SigilClient:
         biscuit_keyring: dict[str, bytes] | None = None,
         active_kid: str | None = None,
         timeout: float = 5.0,
+        approval_timeout: float = 300.0,
+        approval_poll_interval: float = 2.0,
         overflow_dir: str | None = None,
     ) -> None:
         self.base_url: str = (
@@ -281,6 +284,21 @@ class SigilClient:
             kill_switch_fail_mode or os.environ.get("SIGIL_KILL_SWITCH_FAIL_MODE") or "open"
         )
         self.timeout: float = timeout
+        # ENT-81 (SG-4) approval gate: how long the SDK blocks polling a HIGH/CRITICAL
+        # tool call's approval before giving up (fail-closed with "approval_timeout"),
+        # and the interval between status polls. Kept in sync with sigil-core's server-
+        # side approval TTL (300s). The server-sent expires_at is advisory (#307): this
+        # local timeout is the authoritative bound so clock skew cannot over-extend a wait.
+        self.approval_timeout: float = float(
+            approval_timeout
+            if os.environ.get("SIGIL_APPROVAL_TIMEOUT") is None
+            else os.environ["SIGIL_APPROVAL_TIMEOUT"]
+        )
+        self.approval_poll_interval: float = float(
+            approval_poll_interval
+            if os.environ.get("SIGIL_APPROVAL_POLL_INTERVAL") is None
+            else os.environ["SIGIL_APPROVAL_POLL_INTERVAL"]
+        )
         self.biscuit_keyring: dict[str, bytes] = (
             biscuit_keyring if biscuit_keyring is not None else _parse_biscuit_keyring()
         )
@@ -294,6 +312,12 @@ class SigilClient:
             raise ValueError("fail_mode must be 'closed' or 'open'")
         if self.kill_switch_fail_mode not in ("closed", "open"):
             raise ValueError("kill_switch_fail_mode must be 'closed' or 'open'")
+        # Reject NaN/inf too: NaN <= 0 is False and inf passes > 0, either of which would
+        # produce a poll loop that never times out (a hung, ungated tool call).
+        if not math.isfinite(self.approval_timeout) or self.approval_timeout <= 0:
+            raise ValueError("approval_timeout must be a finite number > 0")
+        if not math.isfinite(self.approval_poll_interval) or self.approval_poll_interval <= 0:
+            raise ValueError("approval_poll_interval must be a finite number > 0")
         if not self._internal_token:
             raise ValueError(
                 "internal_token is required. " "Pass it directly or set SIGIL_SDK_TOKEN."
@@ -647,6 +671,66 @@ class SigilClient:
                 status_code=resp.status_code,
             ) from exc
         return result
+
+    def approval_status(self, approval_id: str) -> str:
+        """Poll a pending approval's status (ENT-81/SG-4).
+
+        ``GET {base}/internal/v1/sigil/toolgate/approval/{id}``
+
+        The tenant is derived server-side from sigil-core's verified context (the
+        SDK's scoped token), so an SDK can only read approvals in its own tenant.
+
+        Args:
+            approval_id: the ``approval_id`` returned by :meth:`preflight` on an
+                ``"approve"`` verdict.
+
+        Returns:
+            The approval status string: ``"pending"`` | ``"approved"`` |
+            ``"rejected"`` | ``"expired"``.
+
+        Raises:
+            :class:`~sigil.errors.SigilTransportError`: on network failure.
+            :class:`~sigil.errors.SigilAPIError`: on any non-200 status (incl. 404
+                for an unknown/cross-tenant id) or a non-JSON body. Callers MUST
+                fail closed (deny) on either error.
+        """
+        # URL-encode the id (defence-in-depth path-injection guard; it comes from
+        # sigil-core's own response but must never be interpolated raw).
+        url = f"{self.base_url}/internal/v1/sigil/toolgate/approval/{quote(approval_id, safe='')}"
+        try:
+            resp = self._session.get(
+                url,
+                headers=self._toolgate_headers(),
+                timeout=self.timeout,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise SigilTransportError(
+                "approval_status: transport error reaching sigil-core",
+                method="GET",
+                url=url,
+            ) from exc
+
+        if resp.status_code != 200:
+            raise SigilAPIError(
+                f"approval_status: expected 200, got {resp.status_code}",
+                status_code=resp.status_code,
+            )
+        try:
+            result: dict[str, Any] = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            raise SigilAPIError(
+                f"approval_status: response body is not valid JSON (status={resp.status_code})",
+                status_code=resp.status_code,
+            ) from exc
+        status = str(result.get("status") or "")
+        if not status:
+            # A missing/empty status must fail fast (→ fail-closed deny at the poll site)
+            # rather than looking like "pending" and stalling the poll for the full timeout.
+            raise SigilAPIError(
+                "approval_status: response missing 'status' field",
+                status_code=resp.status_code,
+            )
+        return status
 
     def log_batch(self, events: list[dict[str, Any]]) -> dict[str, Any]:
         """Flush a batch of audit events to sigil-core.

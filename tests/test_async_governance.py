@@ -512,3 +512,70 @@ class TestAsyncPreflightPaths:
             assert ev.get("fail_open") is True, "fail_open flag must be set in event"
         finally:
             client.close()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ENT-81/SG-4 — approval gate on the async path (offloaded via run_in_executor)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestAsyncApprovalGate:
+    def _client(self, sk: SigningKey, tmp_path: Any) -> tuple[SigilClient, str]:
+        client, biscuit = _make_client(sk, ["ns.danger"], overflow_dir=str(tmp_path))
+        client.approval_poll_interval = 0.001
+        client.approval_timeout = 0.05
+        return client, biscuit
+
+    async def test_async_approve_approved_executes(
+        self, sk: SigningKey, tmp_path: Any
+    ) -> None:
+        client, biscuit = self._client(sk, tmp_path)
+
+        @instrumented_tool("ns", "danger", risk_tier="high")
+        async def danger() -> str:
+            await asyncio.sleep(0)
+            return "ok"
+
+        try:
+            with (
+                patch.object(
+                    client._session, "post", return_value=_mock_response(201, _issue_resp(biscuit))
+                ),
+                patch.object(
+                    client, "preflight", return_value={"verdict": "approve", "approval_id": "ap-1"}
+                ),
+                patch.object(client, "approval_status", return_value="approved"),
+                patch.object(client, "log_batch", return_value={"accepted": 1}),
+                client.task(["ns.danger"]),
+            ):
+                assert await danger() == "ok"
+        finally:
+            client.close()
+
+    async def test_async_approve_rejected_denies(
+        self, sk: SigningKey, tmp_path: Any
+    ) -> None:
+        client, biscuit = self._client(sk, tmp_path)
+
+        @instrumented_tool("ns", "danger", risk_tier="high")
+        async def danger() -> str:
+            await asyncio.sleep(0)
+            return "ok"
+
+        try:
+            with (
+                patch.object(
+                    client._session, "post", return_value=_mock_response(201, _issue_resp(biscuit))
+                ),
+                patch.object(
+                    client, "preflight", return_value={"verdict": "approve", "approval_id": "ap-1"}
+                ),
+                patch.object(client, "approval_status", return_value="rejected"),
+                patch.object(client, "log_batch", return_value={"accepted": 1}),
+                client.task(["ns.danger"]),
+            ):
+                with pytest.raises(SigilDeniedError) as exc:
+                    await danger()
+                assert exc.value.denied_reason == "approval_rejected"
+        finally:
+            client.close()

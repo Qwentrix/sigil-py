@@ -197,6 +197,47 @@ def _handle_preflight_unreachable(
     return True
 
 
+# Terminal approval statuses returned by intelligent-automation (via sigil-core's
+# status proxy). Anything else (e.g. "pending") means keep polling.
+_APPROVAL_TERMINAL: frozenset[str] = frozenset({"approved", "rejected", "expired"})
+
+
+def _poll_approval(client: SigilClient, approval_id: str) -> str:
+    """Block-poll a pending ENT-81 approval until it resolves, times out, or the
+    status endpoint becomes unreachable.
+
+    Returns one of:
+      - ``"approved"``    — a sigil_approver approved; the caller may proceed.
+      - ``"rejected"``    — a sigil_approver rejected.
+      - ``"expired"``     — the server marked the approval expired.
+      - ``"timeout"``     — the local ``approval_timeout`` elapsed with no decision.
+      - ``"unavailable"`` — a status poll failed (transport / API error).
+
+    Every non-``approved`` outcome is a FAIL-CLOSED denial at the call site. The
+    local ``approval_timeout`` is the authoritative bound; the server-sent
+    ``expires_at`` is advisory (#307), so clock skew between the SDK host and
+    sigil-core cannot extend the wait beyond the configured timeout.
+    """
+    deadline = time.monotonic() + client.approval_timeout
+    while True:
+        try:
+            status = client.approval_status(approval_id)
+        except Exception:  # noqa: BLE001
+            # Do NOT apply fail_mode here — an approval-gated call must never proceed
+            # ungoverned when the decision cannot be confirmed. ANY error (transport,
+            # API, or unexpected) fails closed.
+            return "unavailable"
+        if status in _APPROVAL_TERMINAL:
+            return status
+        # "pending" (or an unrecognised non-terminal value) — keep waiting.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return "timeout"
+        # Cap the sleep to the time left so a poll_interval larger than the remaining
+        # window cannot push the actual wait past approval_timeout.
+        time.sleep(min(client.approval_poll_interval, remaining))
+
+
 def _governance_check(
     task: SigilTaskContext,
     client: SigilClient,
@@ -351,27 +392,62 @@ def _governance_check(
                     task_id=task_id,
                 )
             elif v == "approve":
-                # v1: approval gates are v2 — treat approve as deny.
-                ev = _make_event(
-                    agent_id,
-                    task_id,
-                    tool_fqn,
-                    namespace,
-                    ah,
-                    0,
-                    "denied",
-                    risk_tier,
-                    denied_reason="approval_required",
-                    args_redacted=args_redacted,
-                )
-                client._log_buffer.push(ev)
-                raise SigilDeniedError(
-                    f"Preflight returned 'approve' for '{tool_fqn}'; "
-                    "approval gates are v2 — treating as deny",
-                    denied_reason="approval_required",
-                    tool_name=tool_fqn,
-                    task_id=task_id,
-                )
+                # ENT-81/SG-4: a HIGH/CRITICAL tool call needs human approval. sigil-core
+                # has opened an intelligent-automation approval; block here polling its
+                # status until a sigil_approver resolves it (or we time out / it becomes
+                # unreachable). Every non-approved outcome is FAIL-CLOSED (deny).
+                approval_id = verdict.get("approval_id")
+                if not approval_id:
+                    # approve verdict with no approval id → the gate could not be opened
+                    # server-side; fail closed.
+                    ev = _make_event(
+                        agent_id,
+                        task_id,
+                        tool_fqn,
+                        namespace,
+                        ah,
+                        0,
+                        "denied",
+                        risk_tier,
+                        denied_reason="approval_service_unavailable",
+                        args_redacted=args_redacted,
+                    )
+                    client._log_buffer.push(ev)
+                    raise SigilDeniedError(
+                        f"Preflight returned 'approve' for '{tool_fqn}' without an "
+                        "approval_id; failing closed",
+                        denied_reason="approval_service_unavailable",
+                        tool_name=tool_fqn,
+                        task_id=task_id,
+                    )
+                outcome = _poll_approval(client, str(approval_id))
+                if outcome != "approved":
+                    reason = {
+                        "rejected": "approval_rejected",
+                        "expired": "approval_expired",
+                        "timeout": "approval_timeout",
+                        "unavailable": "approval_service_unavailable",
+                    }[outcome]
+                    ev = _make_event(
+                        agent_id,
+                        task_id,
+                        tool_fqn,
+                        namespace,
+                        ah,
+                        0,
+                        "denied",
+                        risk_tier,
+                        denied_reason=reason,
+                        args_redacted=args_redacted,
+                    )
+                    client._log_buffer.push(ev)
+                    raise SigilDeniedError(
+                        f"Approval for '{tool_fqn}' resolved to {reason}",
+                        denied_reason=reason,
+                        tool_name=tool_fqn,
+                        task_id=task_id,
+                    )
+                # outcome == "approved": fall through to execute.
             elif v != "allow":
                 # Unknown verdict (e.g. null, "", "ALLOW") — fail closed.
                 ev = _make_event(
