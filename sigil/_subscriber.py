@@ -52,6 +52,15 @@ class _RevocationSubscriber:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
+        # Fail-loud health signals: _connected is set once subscribed and cleared on any
+        # drop, so a silently-degraded kill-switch is observable via healthy()/status().
+        # A live subscriber that never receives is a security regression (fails OPEN),
+        # not a debug event.
+        self._connected = threading.Event()   # thread-safe on its own
+        self._diag_lock = threading.Lock()    # guards the two plain diag fields below
+        self._ever_connected = False
+        self._last_error: str | None = None
+
     def start(self) -> None:
         """Spawn the subscriber daemon thread."""
         self._thread = threading.Thread(
@@ -66,6 +75,7 @@ class _RevocationSubscriber:
         self._stop.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2.0)
+        self._connected.clear()  # a stopped subscriber is not healthy by definition
 
     def is_revoked(self, agent_id: str, task_id: str | None) -> bool:
         """Return True if *agent_id* or *task_id* appears in the revocation registry."""
@@ -73,6 +83,37 @@ class _RevocationSubscriber:
             if agent_id and agent_id in self._revoked:
                 return True
             return bool(task_id and task_id in self._revoked)
+
+    def healthy(self) -> bool:
+        """True only while currently connected AND subscribed to the revocation channel.
+
+        A False here (with the subscriber configured) means kill signals are being
+        missed — the kill-switch is failing OPEN. Surface it on your service's health
+        probe so a degraded kill-switch is visible instead of silent.
+
+        NOTE: returns False during the brief initial-connect window right after start()
+        (before the first subscribe). Callers wiring this into a hard readiness probe
+        should allow a short startup grace period; status()["ever_connected"]
+        distinguishes "still starting" from "was connected, now degraded".
+        """
+        return self._connected.is_set()
+
+    def status(self) -> dict[str, Any]:
+        """Diagnostic snapshot of the subscriber for health endpoints / metrics.
+
+        Deliberately omits the raw channel (which embeds the tenant_id) so this can be
+        exposed on an unauthenticated /health endpoint without leaking tenant identity —
+        only the non-tenant channel prefix is included.
+        """
+        with self._diag_lock:
+            ever_connected = self._ever_connected
+            last_error = self._last_error
+        return {
+            "connected": self._connected.is_set(),
+            "ever_connected": ever_connected,
+            "channel_prefix": _CHANNEL_PREFIX,
+            "last_error": last_error,
+        }
 
     def _set_revoked(self, key: str, reason: str) -> None:
         """Add or update a revocation entry; evict oldest if at cap.
@@ -151,7 +192,11 @@ class _RevocationSubscriber:
                 ps: Any = r.pubsub(ignore_subscribe_messages=True)
                 ps.subscribe(self._channel)
                 backoff = 0.5  # reset on successful connect
-                _log.debug("sigil: revocation subscriber connected on %s", self._channel)
+                with self._diag_lock:
+                    self._ever_connected = True
+                    self._last_error = None
+                self._connected.set()
+                _log.info("sigil: revocation subscriber connected on %s", self._channel)
 
                 while not self._stop.is_set():
                     msg: Any = ps.get_message(ignore_subscribe_messages=True, timeout=1.0)
@@ -167,17 +212,34 @@ class _RevocationSubscriber:
                                 exc_info=True,
                             )
 
+                # Left the read loop (stop or reconnect) — no longer receiving kills.
+                self._connected.clear()
                 try:
                     ps.unsubscribe()
                     ps.close()
                 except Exception:  # noqa: BLE001
                     pass
 
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                self._connected.clear()
+                with self._diag_lock:
+                    # Store the exception CATEGORY only (repr → e.g. "auth:AuthenticationError").
+                    # Never str(exc): auth messages ("WRONGPASS ...") are info-disclosure and
+                    # we must never risk the Redis URL/password reaching logs or status().
+                    self._last_error = repr(exc)
                 if self._stop.is_set():
                     break
-                _log.debug(
-                    "sigil: revocation subscriber error; reconnecting in %.1fs",
+                # Fail LOUD: a subscriber that cannot connect/receive means remote
+                # revocations are silently missed (kill-switch DEGRADED → fails OPEN).
+                # WARNING (throttled by the growing backoff, capped at 30s) so operators
+                # see degraded enforcement instead of it hiding at debug level. Inline log
+                # uses the exception TYPE only (str(exc) can leak WRONGPASS text); exc_info
+                # below carries the full traceback for operators who need detail.
+                _log.warning(
+                    "sigil: revocation subscriber DOWN — kill-switch DEGRADED on %s: %s; "
+                    "reconnecting in %.1fs",
+                    self._channel,
+                    type(exc).__name__,
                     backoff,
                     exc_info=True,
                 )

@@ -503,3 +503,88 @@ class TestSigilTaskContext:
                 assert len(task.task_id) == 36  # UUID format
         finally:
             client_with_key.close()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ENT-81/SG-4 — approval_status client method + config validation
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestApprovalStatus:
+    def test_returns_status_from_get(self, client: SigilClient) -> None:
+        with patch.object(
+            client._session, "get", return_value=_mock_response(200, {"status": "approved"})
+        ) as g:
+            assert client.approval_status("ap-1") == "approved"
+        # GET the tenant-scoped status path (tenant is derived server-side).
+        assert g.call_args.args[0].endswith("/internal/v1/sigil/toolgate/approval/ap-1")
+
+    def test_missing_status_raises_api_error(self, client: SigilClient) -> None:
+        # A missing/empty status must fail fast so the poll denies rather than stalling.
+        with (
+            patch.object(client._session, "get", return_value=_mock_response(200, {})),
+            pytest.raises(SigilAPIError),
+        ):
+            client.approval_status("ap-1")
+
+    def test_non_200_raises_api_error(self, client: SigilClient) -> None:
+        with (
+            patch.object(client._session, "get", return_value=_mock_response(404, {})),
+            pytest.raises(SigilAPIError),
+        ):
+            client.approval_status("nope")
+
+    def test_transport_error_raises(self, client: SigilClient) -> None:
+        with (
+            patch.object(client._session, "get", side_effect=ConnectionError("refused")),
+            pytest.raises(SigilTransportError),
+        ):
+            client.approval_status("ap-1")
+
+
+class TestRedeemApproval:
+    def test_returns_grant_from_post(self, client: SigilClient) -> None:
+        body = {"one_shot_token": "os", "revocation_id": "rev-1", "tool_name": "ns.tool"}
+        with patch.object(
+            client._session, "post", return_value=_mock_response(200, body)
+        ) as p:
+            out = client.redeem_approval("ap-1", "parent-tok")
+        assert out["revocation_id"] == "rev-1"
+        assert p.call_args.args[0].endswith("/internal/v1/sigil/toolgate/approval/ap-1/redeem")
+        assert p.call_args.kwargs["json"] == {"token": "parent-tok"}
+
+    def test_409_raises_api_error_with_status(self, client: SigilClient) -> None:
+        with (
+            patch.object(client._session, "post", return_value=_mock_response(409, {})),
+            pytest.raises(SigilAPIError) as exc,
+        ):
+            client.redeem_approval("ap-1", "tok")
+        assert exc.value.status_code == 409
+
+    def test_missing_revocation_id_raises(self, client: SigilClient) -> None:
+        with (
+            patch.object(
+                client._session, "post", return_value=_mock_response(200, {"one_shot_token": "os"})
+            ),
+            pytest.raises(SigilAPIError),
+        ):
+            client.redeem_approval("ap-1", "tok")
+
+    def test_transport_error_raises(self, client: SigilClient) -> None:
+        with (
+            patch.object(client._session, "post", side_effect=ConnectionError("refused")),
+            pytest.raises(SigilTransportError),
+        ):
+            client.redeem_approval("ap-1", "tok")
+
+
+class TestApprovalConfigValidation:
+    def test_rejects_non_finite_timeout(self) -> None:
+        for bad in (float("nan"), float("inf"), 0.0, -1.0):
+            with pytest.raises(ValueError, match="approval_timeout"):
+                SigilClient(internal_token="tok", approval_timeout=bad)
+
+    def test_rejects_non_finite_poll_interval(self) -> None:
+        for bad in (float("nan"), float("inf"), 0.0):
+            with pytest.raises(ValueError, match="approval_poll_interval"):
+                SigilClient(internal_token="tok", approval_poll_interval=bad)

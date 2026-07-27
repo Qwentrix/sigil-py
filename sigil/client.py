@@ -23,10 +23,11 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import math
 import os
 import uuid
 from typing import TYPE_CHECKING
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import requests
 
@@ -251,9 +252,12 @@ class SigilClient:
         agent_id: str | None = None,
         service_account_id: str | None = None,
         fail_mode: str | None = None,
+        kill_switch_fail_mode: str | None = None,
         biscuit_keyring: dict[str, bytes] | None = None,
         active_kid: str | None = None,
         timeout: float = 5.0,
+        approval_timeout: float = 300.0,
+        approval_poll_interval: float = 2.0,
         overflow_dir: str | None = None,
     ) -> None:
         self.base_url: str = (
@@ -271,7 +275,30 @@ class SigilClient:
             service_account_id or os.environ.get("SIGIL_SERVICE_ACCOUNT_ID") or ""
         )
         self.fail_mode: str = fail_mode or os.environ.get("SIGIL_FAIL_MODE") or "closed"
+        # How governed calls behave when the revocation subscriber is configured but
+        # DEGRADED (can't receive kills). Default "open" = prior behavior (allow; rely on
+        # the subscriber's WARNING + is_kill_switch_healthy()). "closed" = strict posture:
+        # deny governed calls while the kill-switch cannot be guaranteed (see
+        # _governance_check in decorators.py). Independent of fail_mode (sigil-core reach).
+        self.kill_switch_fail_mode: str = (
+            kill_switch_fail_mode or os.environ.get("SIGIL_KILL_SWITCH_FAIL_MODE") or "open"
+        )
         self.timeout: float = timeout
+        # ENT-81 (SG-4) approval gate: how long the SDK blocks polling a HIGH/CRITICAL
+        # tool call's approval before giving up (fail-closed with "approval_timeout"),
+        # and the interval between status polls. Kept in sync with sigil-core's server-
+        # side approval TTL (300s). The server-sent expires_at is advisory (#307): this
+        # local timeout is the authoritative bound so clock skew cannot over-extend a wait.
+        self.approval_timeout: float = float(
+            approval_timeout
+            if os.environ.get("SIGIL_APPROVAL_TIMEOUT") is None
+            else os.environ["SIGIL_APPROVAL_TIMEOUT"]
+        )
+        self.approval_poll_interval: float = float(
+            approval_poll_interval
+            if os.environ.get("SIGIL_APPROVAL_POLL_INTERVAL") is None
+            else os.environ["SIGIL_APPROVAL_POLL_INTERVAL"]
+        )
         self.biscuit_keyring: dict[str, bytes] = (
             biscuit_keyring if biscuit_keyring is not None else _parse_biscuit_keyring()
         )
@@ -283,6 +310,14 @@ class SigilClient:
 
         if self.fail_mode not in ("closed", "open"):
             raise ValueError("fail_mode must be 'closed' or 'open'")
+        if self.kill_switch_fail_mode not in ("closed", "open"):
+            raise ValueError("kill_switch_fail_mode must be 'closed' or 'open'")
+        # Reject NaN/inf too: NaN <= 0 is False and inf passes > 0, either of which would
+        # produce a poll loop that never times out (a hung, ungated tool call).
+        if not math.isfinite(self.approval_timeout) or self.approval_timeout <= 0:
+            raise ValueError("approval_timeout must be a finite number > 0")
+        if not math.isfinite(self.approval_poll_interval) or self.approval_poll_interval <= 0:
+            raise ValueError("approval_poll_interval must be a finite number > 0")
         if not self._internal_token:
             raise ValueError(
                 "internal_token is required. " "Pass it directly or set SIGIL_SDK_TOKEN."
@@ -321,6 +356,7 @@ class SigilClient:
 
         # Kill-switch subscriber — only if SIGIL_REDIS_URL is set.
         redis_url = os.environ.get("SIGIL_REDIS_URL", "")
+        self._redis_url_configured = bool(redis_url)
         if redis_url and self.tenant_id:
             self._subscriber: _RevocationSubscriber | None = _RevocationSubscriber(
                 tenant_id=self.tenant_id,
@@ -328,11 +364,19 @@ class SigilClient:
                 redis_url=redis_url,
             )
             self._subscriber.start()
+        elif redis_url and not self.tenant_id:
+            # Fail LOUD: the operator configured a kill-switch but it cannot start (no
+            # tenant_id → no channel), so remote revocations would be silently missed.
+            self._subscriber = None
+            _log.warning(
+                "sigil: SIGIL_REDIS_URL is set but tenant_id is empty — kill-switch "
+                "subscriber NOT started; remote revocations will NOT be enforced. "
+                "Set SIGIL_TENANT_ID."
+            )
         else:
             self._subscriber = None
             _log.debug(
-                "sigil: SIGIL_REDIS_URL not set or tenant_id missing — "
-                "revocation subscriber disabled"
+                "sigil: SIGIL_REDIS_URL not set — revocation subscriber disabled (by config)"
             )
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -376,6 +420,37 @@ class SigilClient:
         if self._subscriber is None:
             return False
         return self._subscriber.is_revoked(agent_id, task_id)
+
+    def is_kill_switch_healthy(self) -> bool:
+        """True if the remote kill-switch is operational (or intentionally disabled).
+
+        Returns False ONLY for the dangerous case: SIGIL_REDIS_URL was configured (the
+        operator wants remote revocation) but the subscriber is not currently connected
+        — a kill signal would be silently missed. Surface this on your service's health
+        probe / a metric so a degraded kill-switch fails LOUD instead of open.
+        """
+        if self._subscriber is not None:
+            return self._subscriber.healthy()
+        # No subscriber: healthy only if the kill-switch was intentionally not configured.
+        return not self._redis_url_configured
+
+    def kill_switch_status(self) -> dict[str, Any]:
+        """Diagnostic snapshot of the kill-switch subscriber for health endpoints/metrics."""
+        if self._subscriber is not None:
+            return {
+                "enabled": True,
+                "healthy": self._subscriber.healthy(),
+                **self._subscriber.status(),
+            }
+        return {
+            "enabled": False,
+            "healthy": not self._redis_url_configured,
+            "detail": (
+                "SIGIL_REDIS_URL set but tenant_id missing — subscriber not started"
+                if self._redis_url_configured
+                else "revocation subscriber disabled (SIGIL_REDIS_URL not set)"
+            ),
+        }
 
     # ── Internal header helpers ───────────────────────────────────────────────
 
@@ -595,6 +670,130 @@ class SigilClient:
                 f"preflight: response body is not valid JSON (status={resp.status_code})",
                 status_code=resp.status_code,
             ) from exc
+        return result
+
+    def approval_status(self, approval_id: str) -> str:
+        """Poll a pending approval's status (ENT-81/SG-4).
+
+        ``GET {base}/internal/v1/sigil/toolgate/approval/{id}``
+
+        The tenant is derived server-side from sigil-core's verified context (the
+        SDK's scoped token), so an SDK can only read approvals in its own tenant.
+
+        Args:
+            approval_id: the ``approval_id`` returned by :meth:`preflight` on an
+                ``"approve"`` verdict.
+
+        Returns:
+            The approval status string: ``"pending"`` | ``"approved"`` |
+            ``"rejected"`` | ``"expired"``.
+
+        Raises:
+            :class:`~sigil.errors.SigilTransportError`: on network failure.
+            :class:`~sigil.errors.SigilAPIError`: on any non-200 status (incl. 404
+                for an unknown/cross-tenant id) or a non-JSON body. Callers MUST
+                fail closed (deny) on either error.
+        """
+        # URL-encode the id (defence-in-depth path-injection guard; it comes from
+        # sigil-core's own response but must never be interpolated raw).
+        url = f"{self.base_url}/internal/v1/sigil/toolgate/approval/{quote(approval_id, safe='')}"
+        try:
+            resp = self._session.get(
+                url,
+                headers=self._toolgate_headers(),
+                timeout=self.timeout,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise SigilTransportError(
+                "approval_status: transport error reaching sigil-core",
+                method="GET",
+                url=url,
+            ) from exc
+
+        if resp.status_code != 200:
+            raise SigilAPIError(
+                f"approval_status: expected 200, got {resp.status_code}",
+                status_code=resp.status_code,
+            )
+        try:
+            result: dict[str, Any] = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            raise SigilAPIError(
+                f"approval_status: response body is not valid JSON (status={resp.status_code})",
+                status_code=resp.status_code,
+            ) from exc
+        status = str(result.get("status") or "")
+        if not status:
+            # A missing/empty status must fail fast (→ fail-closed deny at the poll site)
+            # rather than looking like "pending" and stalling the poll for the full timeout.
+            raise SigilAPIError(
+                "approval_status: response missing 'status' field",
+                status_code=resp.status_code,
+            )
+        return status
+
+    def redeem_approval(self, approval_id: str, token: str) -> dict[str, Any]:
+        """Redeem an APPROVED approval for a one-shot, single-use grant (ENT-82/SG-4).
+
+        ``POST {base}/internal/v1/sigil/toolgate/approval/{id}/redeem``
+
+        Call this exactly once after :meth:`approval_status` returns ``"approved"``.
+        sigil-core derives the approved tool + agent from the approval record (never from
+        this call), verifies *token* authorizes that tool and belongs to that agent, and
+        atomically consumes a single-use nonce before minting a tool-scoped, short-TTL
+        one-shot token. The response's ``revocation_id`` is the cryptographic proof that
+        the call ran under a fresh, human-approved, single-use grant.
+
+        Args:
+            approval_id: the ``approval_id`` returned by :meth:`preflight`.
+            token: the active Biscuit task token (the parent to attenuate). Never logged.
+
+        Returns:
+            dict with ``one_shot_token``, ``revocation_id``, ``expires_at``, ``tool_name``.
+
+        Raises:
+            :class:`~sigil.errors.SigilTransportError`: on network failure.
+            :class:`~sigil.errors.SigilAPIError`: on any non-200 (409 = already redeemed;
+                403/404/502/503 = not redeemable / unavailable). The caller MUST fail
+                closed (deny) on either — a governed call must never proceed without a
+                confirmed single-use redemption. The ``status_code`` distinguishes 409.
+        """
+        url = (
+            f"{self.base_url}/internal/v1/sigil/toolgate/approval/"
+            f"{quote(approval_id, safe='')}/redeem"
+        )
+        try:
+            resp = self._session.post(
+                url,
+                headers=self._toolgate_headers(),
+                json={"token": token},
+                timeout=self.timeout,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise SigilTransportError(
+                "redeem_approval: transport error reaching sigil-core",
+                method="POST",
+                url=url,
+            ) from exc
+
+        if resp.status_code != 200:
+            raise SigilAPIError(
+                f"redeem_approval: expected 200, got {resp.status_code}",
+                status_code=resp.status_code,
+            )
+        try:
+            result: dict[str, Any] = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            raise SigilAPIError(
+                f"redeem_approval: response body is not valid JSON (status={resp.status_code})",
+                status_code=resp.status_code,
+            ) from exc
+        if not str(result.get("revocation_id") or ""):
+            # No grant proof → treat as a failed redemption (fail-closed at the call site).
+            raise SigilAPIError(
+                "redeem_approval: response missing 'revocation_id'",
+                status_code=resp.status_code,
+            )
         return result
 
     def log_batch(self, events: list[dict[str, Any]]) -> dict[str, Any]:

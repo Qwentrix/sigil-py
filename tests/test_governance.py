@@ -15,6 +15,7 @@ AC8 — batching: 50 events triggers immediate flush; 500ms timer fires; overflo
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import sys
@@ -479,8 +480,11 @@ class TestAC6HighRiskPreflight:
         finally:
             client.close()
 
-    def test_approve_verdict_treated_as_deny_v1(self, sk: SigningKey, tmp_path: Any) -> None:
-        """v1: 'approve' verdict → SigilDeniedError(approval_required)."""
+    def test_approve_without_approval_id_fails_closed(self, sk: SigningKey, tmp_path: Any) -> None:
+        """ENT-81/SG-4: an 'approve' verdict with no approval_id means the gate could
+        not be opened server-side — fail closed (approval_service_unavailable). The
+        full approval poll flow (approved/rejected/expired/timeout/unreachable) is
+        covered by TestApprovalGate."""
         client, biscuit = _make_client(sk, ["ns.gate"], overflow_dir=str(tmp_path))
 
         @instrumented_tool("ns", "gate", risk_tier="high")
@@ -508,7 +512,7 @@ class TestAC6HighRiskPreflight:
                 ):
                     gated_call()
 
-                assert exc_info.value.denied_reason == "approval_required"
+                assert exc_info.value.denied_reason == "approval_service_unavailable"
         finally:
             client.close()
 
@@ -1682,3 +1686,513 @@ class TestF4RevocationFloodProtection:
         ), "Task revocation for other agent's task must not affect us"
         with sub._lock:
             assert len(sub._revoked) == 0, "Registry must be empty"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# AC7 — ENT-81/SG-4 approval gate: 'approve' verdict → block-poll approval status
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestApprovalGate:
+    def _client(self, sk: SigningKey, tmp_path: Any) -> tuple[SigilClient, str]:
+        client, biscuit = _make_client(sk, ["ns.dangerous"], overflow_dir=str(tmp_path))
+        # Fast, deterministic polling for tests.
+        client.approval_poll_interval = 0.001
+        client.approval_timeout = 0.05
+        return client, biscuit
+
+    @contextlib.contextmanager
+    def _gate(
+        self,
+        client: SigilClient,
+        biscuit: str,
+        preflight_ret: dict[str, Any],
+        status_side: Any,
+    ) -> Any:
+        """Yield (callable, approval_status_mock) with all patches + an active task
+        context still OPEN, so the tool call runs inside the governed scope."""
+
+        @instrumented_tool("ns", "dangerous", risk_tier="high")
+        def dangerous_call() -> str:
+            return "ok"
+
+        is_exc = isinstance(status_side, BaseException) or (
+            isinstance(status_side, type) and issubclass(status_side, BaseException)
+        )
+        status_kw = {"side_effect": status_side} if is_exc else {"return_value": status_side}
+        with (
+            patch.object(
+                client._session, "post", return_value=_mock_response(201, _issue_resp(biscuit))
+            ),
+            patch.object(client, "preflight", return_value=preflight_ret),
+            patch.object(client, "approval_status", **status_kw) as mock_status,
+            # ENT-82: the approved path redeems for a one-shot grant; mock it so approved
+            # tests execute. Denial-path tests never reach redeem (they deny at finalize).
+            patch.object(
+                client, "redeem_approval",
+                return_value={"revocation_id": "grant-ok", "one_shot_token": "t"},
+            ),
+            patch.object(client, "log_batch", return_value={"accepted": 1}),
+            client.task(["ns.dangerous"]),
+        ):
+            yield dangerous_call, mock_status
+
+    _APPROVE = {"verdict": "approve", "approval_id": "ap-1"}
+
+    def test_approve_approved_executes(self, sk: SigningKey, tmp_path: Any) -> None:
+        client, biscuit = self._client(sk, tmp_path)
+        try:
+            with self._gate(client, biscuit, self._APPROVE, "approved") as (call, mock_status):
+                assert call() == "ok"
+                mock_status.assert_called()
+        finally:
+            client.close()
+
+    def test_approve_redeem_replayed_denies(self, sk: SigningKey, tmp_path: Any) -> None:
+        """ENT-82: a 409 from redeem (approval already redeemed) fails CLOSED — the tool
+        does NOT execute and the denial reason is approval_replayed."""
+        client, biscuit = self._client(sk, tmp_path)
+
+        @instrumented_tool("ns", "dangerous", risk_tier="high")
+        def call() -> str:
+            return "ok"
+
+        try:
+            with (
+                patch.object(
+                    client._session, "post", return_value=_mock_response(201, _issue_resp(biscuit))
+                ),
+                patch.object(client, "preflight", return_value=self._APPROVE),
+                patch.object(client, "approval_status", return_value="approved"),
+                patch.object(
+                    client, "redeem_approval",
+                    side_effect=SigilAPIError("already redeemed", status_code=409),
+                ),
+                patch.object(client, "log_batch", return_value={"accepted": 1}),
+                client.task(["ns.dangerous"]),
+            ):
+                with pytest.raises(SigilDeniedError) as exc:
+                    call()
+                assert exc.value.denied_reason == "approval_replayed"
+        finally:
+            client.close()
+
+    def test_approve_redeem_unavailable_denies(self, sk: SigningKey, tmp_path: Any) -> None:
+        """ENT-82: a transport failure on redeem fails CLOSED with approval_token_unavailable."""
+        client, biscuit = self._client(sk, tmp_path)
+
+        @instrumented_tool("ns", "dangerous", risk_tier="high")
+        def call() -> str:
+            return "ok"
+
+        try:
+            with (
+                patch.object(
+                    client._session, "post", return_value=_mock_response(201, _issue_resp(biscuit))
+                ),
+                patch.object(client, "preflight", return_value=self._APPROVE),
+                patch.object(client, "approval_status", return_value="approved"),
+                patch.object(
+                    client, "redeem_approval",
+                    side_effect=SigilTransportError("down", method="POST", url="http://x/"),
+                ),
+                patch.object(client, "log_batch", return_value={"accepted": 1}),
+                client.task(["ns.dangerous"]),
+            ):
+                with pytest.raises(SigilDeniedError) as exc:
+                    call()
+                assert exc.value.denied_reason == "approval_token_unavailable"
+        finally:
+            client.close()
+
+    def test_approve_grant_id_recorded_in_audit(self, sk: SigningKey, tmp_path: Any) -> None:
+        """ENT-82: on a redeemed approval the execution audit event carries the one-shot
+        grant's revocation_id as proof the call ran under a fresh single-use grant."""
+        client, biscuit = self._client(sk, tmp_path)
+        captured: list[dict[str, Any]] = []
+
+        @instrumented_tool("ns", "dangerous", risk_tier="high")
+        def call() -> str:
+            return "ok"
+
+        try:
+            with (
+                patch.object(
+                    client._session, "post", return_value=_mock_response(201, _issue_resp(biscuit))
+                ),
+                patch.object(client, "preflight", return_value=self._APPROVE),
+                patch.object(client, "approval_status", return_value="approved"),
+                patch.object(
+                    client, "redeem_approval",
+                    return_value={"revocation_id": "rev-xyz", "one_shot_token": "t"},
+                ),
+                patch.object(client._log_buffer, "push", side_effect=captured.append),
+                client.task(["ns.dangerous"]),
+            ):
+                assert call() == "ok"
+            allowed = next(e for e in captured if e.get("outcome") == "allowed")
+            assert allowed.get("approval_grant_id") == "rev-xyz"
+        finally:
+            client.close()
+
+    def test_approve_rejected_denies(self, sk: SigningKey, tmp_path: Any) -> None:
+        client, biscuit = self._client(sk, tmp_path)
+        try:
+            with self._gate(client, biscuit, self._APPROVE, "rejected") as (call, _):
+                with pytest.raises(SigilDeniedError) as exc:
+                    call()
+                assert exc.value.denied_reason == "approval_rejected"
+        finally:
+            client.close()
+
+    def test_approve_expired_denies(self, sk: SigningKey, tmp_path: Any) -> None:
+        client, biscuit = self._client(sk, tmp_path)
+        try:
+            with self._gate(client, biscuit, self._APPROVE, "expired") as (call, _):
+                with pytest.raises(SigilDeniedError) as exc:
+                    call()
+                assert exc.value.denied_reason == "approval_expired"
+        finally:
+            client.close()
+
+    def test_approve_timeout_denies(self, sk: SigningKey, tmp_path: Any) -> None:
+        client, biscuit = self._client(sk, tmp_path)
+        try:
+            # Always pending → the local approval_timeout elapses → fail closed.
+            with self._gate(client, biscuit, self._APPROVE, "pending") as (call, _):
+                with pytest.raises(SigilDeniedError) as exc:
+                    call()
+                assert exc.value.denied_reason == "approval_timeout"
+        finally:
+            client.close()
+
+    def test_approve_poll_unreachable_fails_closed(self, sk: SigningKey, tmp_path: Any) -> None:
+        client, biscuit = self._client(sk, tmp_path)
+        try:
+            err = SigilTransportError("boom", method="GET", url="http://x")
+            with self._gate(client, biscuit, self._APPROVE, err) as (call, _):
+                with pytest.raises(SigilDeniedError) as exc:
+                    call()
+                # A status-poll failure must NEVER apply fail_mode — always deny.
+                assert exc.value.denied_reason == "approval_service_unavailable"
+        finally:
+            client.close()
+
+    def test_approve_missing_id_fails_closed(self, sk: SigningKey, tmp_path: Any) -> None:
+        client, biscuit = self._client(sk, tmp_path)
+        try:
+            # approve verdict but no approval_id → never poll; fail closed immediately.
+            with self._gate(
+                client, biscuit, {"verdict": "approve"}, "approved"
+            ) as (call, mock_status):
+                with pytest.raises(SigilDeniedError) as exc:
+                    call()
+                assert exc.value.denied_reason == "approval_service_unavailable"
+                mock_status.assert_not_called()
+        finally:
+            client.close()
+
+    def test_approve_timeout_capped_by_deadline_not_interval(
+        self, sk: SigningKey, tmp_path: Any
+    ) -> None:
+        # poll_interval (5s) is far larger than approval_timeout (0.02s): the sleep must
+        # be capped to the remaining window so the wait cannot overshoot the timeout.
+        import time as _time
+
+        client, biscuit = _make_client(sk, ["ns.dangerous"], overflow_dir=str(tmp_path))
+        client.approval_poll_interval = 5.0
+        client.approval_timeout = 0.02
+        try:
+            with self._gate(client, biscuit, self._APPROVE, "pending") as (call, _):
+                start = _time.monotonic()
+                with pytest.raises(SigilDeniedError) as exc:
+                    call()
+                elapsed = _time.monotonic() - start
+                assert exc.value.denied_reason == "approval_timeout"
+                assert elapsed < 2.0, f"timeout overshot the deadline: {elapsed:.3f}s"
+        finally:
+            client.close()
+
+    def test_approve_poll_error_fails_closed_even_with_fail_mode_open(
+        self, sk: SigningKey, tmp_path: Any
+    ) -> None:
+        # A status-poll API error must fail closed even when fail_mode="open" — an
+        # approval-gated call can never proceed ungoverned. Also exercises the
+        # SigilAPIError branch of the poll's catch-all.
+        client, biscuit = _make_client(
+            sk, ["ns.dangerous"], fail_mode="open", overflow_dir=str(tmp_path)
+        )
+        client.approval_poll_interval = 0.001
+        client.approval_timeout = 0.05
+        try:
+            err = SigilAPIError("internal server error", status_code=500)
+            with self._gate(client, biscuit, self._APPROVE, err) as (call, _):
+                with pytest.raises(SigilDeniedError) as exc:
+                    call()
+                assert exc.value.denied_reason == "approval_service_unavailable"
+        finally:
+            client.close()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SG-5 — latency_ms + prompt_entropy in audit events
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestShannonEntropy:
+    """Unit tests for the _shannon_entropy helper."""
+
+    def test_empty_string_returns_zero(self) -> None:
+        from sigil.decorators import _shannon_entropy
+
+        assert _shannon_entropy("") == 0.0
+
+    def test_whitespace_only_returns_zero(self) -> None:
+        from sigil.decorators import _shannon_entropy
+
+        assert _shannon_entropy("   \t\n  ") == 0.0
+
+    def test_single_repeated_char_returns_zero(self) -> None:
+        from sigil.decorators import _shannon_entropy
+
+        assert _shannon_entropy("aaaaaaa") == 0.0
+
+    def test_high_variety_text_greater_than_single_char(self) -> None:
+        from sigil.decorators import _shannon_entropy
+
+        low = _shannon_entropy("aaaaaaa")
+        high = _shannon_entropy("the quick brown fox jumps over the lazy dog")
+        assert high > low
+
+    def test_four_equally_likely_symbols_return_two_bits(self) -> None:
+        from sigil.decorators import _shannon_entropy
+
+        # "abcd" has 4 symbols each with prob 0.25 → H = 2.0 bits
+        assert abs(_shannon_entropy("abcd") - 2.0) < 1e-9
+
+    def test_returns_float(self) -> None:
+        from sigil.decorators import _shannon_entropy
+
+        result = _shannon_entropy("hello world")
+        assert isinstance(result, float)
+
+
+class TestSG5AuditFields:
+    """Integration tests: latency_ms and prompt_entropy are present in audit events."""
+
+    def test_instrumented_llm_event_has_nonzero_prompt_entropy_and_nonneg_latency(
+        self, sk: SigningKey, tmp_path: Any
+    ) -> None:
+        """instrumented_llm audit event carries non-zero prompt_entropy and latency_ms >= 0."""
+        client, biscuit = _make_client(sk, ["llm.chat"], overflow_dir=str(tmp_path))
+        captured: list[dict[str, Any]] = []
+
+        @instrumented_llm("llm", "chat")
+        def chat(prompt: str) -> str:
+            return "response"
+
+        try:
+            with (
+                patch.object(
+                    client._session,
+                    "post",
+                    return_value=_mock_response(201, _issue_resp(biscuit)),
+                ),
+                patch.object(
+                    client._log_buffer, "push", side_effect=captured.append
+                ),
+                client.task(["llm.chat"]) as _task,
+            ):
+                # High-variety prompt → non-zero entropy.
+                chat("the quick brown fox jumps over the lazy dog")
+
+            ev = next(e for e in captured if e.get("outcome") in ("allowed", "error"))
+            assert "prompt_entropy" in ev, "prompt_entropy missing from LLM audit event"
+            assert ev["prompt_entropy"] > 0.0, "prompt_entropy should be > 0 for a varied prompt"
+            assert "latency_ms" in ev, "latency_ms missing from LLM audit event"
+            assert ev["latency_ms"] >= 0, "latency_ms must be non-negative"
+        finally:
+            client.close()
+
+    def test_instrumented_tool_event_has_zero_prompt_entropy(
+        self, sk: SigningKey, tmp_path: Any
+    ) -> None:
+        """instrumented_tool audit event carries prompt_entropy == 0.0."""
+        client, biscuit = _make_client(sk, ["ns.action"], overflow_dir=str(tmp_path))
+        captured: list[dict[str, Any]] = []
+
+        @instrumented_tool("ns", "action")
+        def action(x: int) -> int:
+            return x + 1
+
+        try:
+            with (
+                patch.object(
+                    client._session,
+                    "post",
+                    return_value=_mock_response(201, _issue_resp(biscuit)),
+                ),
+                patch.object(
+                    client._log_buffer, "push", side_effect=captured.append
+                ),
+                client.task(["ns.action"]) as _task,
+            ):
+                action(41)
+
+            ev = next(e for e in captured if e.get("outcome") in ("allowed", "error"))
+            assert "prompt_entropy" in ev, "prompt_entropy missing from tool audit event"
+            assert ev["prompt_entropy"] == 0.0, "instrumented_tool must emit prompt_entropy=0"
+            assert "latency_ms" in ev, "latency_ms missing from tool audit event"
+            assert ev["latency_ms"] >= 0
+        finally:
+            client.close()
+
+    def test_instrumented_llm_low_entropy_prompt_emits_low_entropy(
+        self, sk: SigningKey, tmp_path: Any
+    ) -> None:
+        """A single-character repeated prompt should emit a lower entropy than a varied one."""
+        from sigil.decorators import _shannon_entropy
+
+        client, biscuit = _make_client(sk, ["llm.mono"], overflow_dir=str(tmp_path))
+        captured: list[dict[str, Any]] = []
+
+        @instrumented_llm("llm", "mono")
+        def mono(prompt: str) -> str:
+            return "ok"
+
+        try:
+            with (
+                patch.object(
+                    client._session,
+                    "post",
+                    return_value=_mock_response(201, _issue_resp(biscuit)),
+                ),
+                patch.object(
+                    client._log_buffer, "push", side_effect=captured.append
+                ),
+                client.task(["llm.mono"]) as _task,
+            ):
+                mono("aaaaaaa")
+
+            ev = next(e for e in captured if e.get("outcome") in ("allowed", "error"))
+            assert ev["prompt_entropy"] == _shannon_entropy("aaaaaaa")
+        finally:
+            client.close()
+
+    def test_instrumented_llm_with_messages_kwarg_produces_nonzero_entropy(
+        self, sk: SigningKey, tmp_path: Any
+    ) -> None:
+        """instrumented_llm called with a messages kwarg list → prompt_entropy > 0.
+
+        Mirrors FIX 6 (d): the _extract_prompt helper must join the 'content' fields
+        of dicts in the 'messages' kwarg and compute entropy over the result.
+        """
+        client, biscuit = _make_client(sk, ["llm.msgs"], overflow_dir=str(tmp_path))
+        captured: list[dict[str, Any]] = []
+
+        @instrumented_llm("llm", "msgs")
+        def chat(**kwargs: Any) -> str:  # type: ignore[misc]
+            return "reply"
+
+        try:
+            with (
+                patch.object(
+                    client._session,
+                    "post",
+                    return_value=_mock_response(201, _issue_resp(biscuit)),
+                ),
+                patch.object(
+                    client._log_buffer, "push", side_effect=captured.append
+                ),
+                client.task(["llm.msgs"]) as _task,
+            ):
+                chat(
+                    messages=[
+                        {"role": "system", "content": "You are a helpful assistant."},
+                        {"role": "user", "content": "the quick brown fox jumps over the lazy dog"},
+                    ]
+                )
+
+            ev = next(e for e in captured if e.get("outcome") in ("allowed", "error"))
+            assert "prompt_entropy" in ev, "prompt_entropy missing from LLM audit event"
+            assert ev["prompt_entropy"] > 0.0, (
+                "prompt_entropy should be > 0 for a high-variety messages-kwarg prompt"
+            )
+        finally:
+            client.close()
+
+    def test_instrumented_llm_with_messages_positional_arg_produces_nonzero_entropy(
+        self, sk: SigningKey, tmp_path: Any
+    ) -> None:
+        """instrumented_llm called with a messages list as positional arg → prompt_entropy > 0.
+
+        Mirrors FIX 6 (b): the _extract_prompt helper must join content fields from
+        a positional list arg.
+        """
+        client, biscuit = _make_client(sk, ["llm.msgpos"], overflow_dir=str(tmp_path))
+        captured: list[dict[str, Any]] = []
+
+        @instrumented_llm("llm", "msgpos")
+        def chat_pos(*args: Any) -> str:
+            return "reply"
+
+        try:
+            with (
+                patch.object(
+                    client._session,
+                    "post",
+                    return_value=_mock_response(201, _issue_resp(biscuit)),
+                ),
+                patch.object(
+                    client._log_buffer, "push", side_effect=captured.append
+                ),
+                client.task(["llm.msgpos"]) as _task,
+            ):
+                chat_pos([
+                    {"role": "user", "content": "the quick brown fox jumps over the lazy dog"},
+                ])
+
+            ev = next(e for e in captured if e.get("outcome") in ("allowed", "error"))
+            assert ev["prompt_entropy"] > 0.0, (
+                "prompt_entropy should be > 0 for a varied messages-list positional arg"
+            )
+        finally:
+            client.close()
+
+    def test_instrumented_llm_with_non_extractable_first_arg_produces_zero_entropy(
+        self, sk: SigningKey, tmp_path: Any
+    ) -> None:
+        """instrumented_llm with an unrecognised first arg → prompt_entropy == 0.0.
+
+        When _extract_prompt cannot identify any text from the arguments it must
+        return "" so _shannon_entropy yields 0.0 and the call does not raise.
+        """
+        client, biscuit = _make_client(sk, ["llm.opaque"], overflow_dir=str(tmp_path))
+        captured: list[dict[str, Any]] = []
+
+        @instrumented_llm("llm", "opaque")
+        def opaque_llm(*args: Any) -> str:
+            return "reply"
+
+        try:
+            with (
+                patch.object(
+                    client._session,
+                    "post",
+                    return_value=_mock_response(201, _issue_resp(biscuit)),
+                ),
+                patch.object(
+                    client._log_buffer, "push", side_effect=captured.append
+                ),
+                client.task(["llm.opaque"]) as _task,
+            ):
+                # A numeric first arg has no extractable text.
+                opaque_llm(42)
+
+            ev = next(e for e in captured if e.get("outcome") in ("allowed", "error"))
+            assert "prompt_entropy" in ev, "prompt_entropy missing from audit event"
+            assert ev["prompt_entropy"] == 0.0, (
+                "Non-extractable first arg must produce prompt_entropy=0.0"
+            )
+        finally:
+            client.close()
