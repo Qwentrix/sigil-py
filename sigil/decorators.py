@@ -98,6 +98,7 @@ def _make_event(
     denied_reason: str | None = None,
     args_redacted: Any = None,
     fail_open: bool = False,
+    approval_grant_id: str | None = None,
 ) -> dict[str, Any]:
     """Build an audit event dict conforming to docs/protocol.md §4.1."""
     ev: dict[str, Any] = {
@@ -116,6 +117,11 @@ def _make_event(
         ev["args_redacted"] = args_redacted
     if fail_open:
         ev["fail_open"] = True
+    if approval_grant_id:
+        # ENT-82: the revocation_id of the one-shot single-use grant minted when the
+        # human approval was redeemed — cryptographic proof this call ran under a fresh,
+        # tool-scoped, human-approved grant (not the broad task token).
+        ev["approval_grant_id"] = approval_grant_id
     return ev
 
 
@@ -580,6 +586,123 @@ def _finalize_approval(
     )
 
 
+def _redeem_denied_reason(exc: Exception) -> str:
+    """Map a redeem failure to a bounded denial reason. HTTP 409 = the approval was
+    already redeemed (single-use exhausted); anything else = the one-shot could not be
+    minted / confirmed."""
+    if getattr(exc, "status_code", None) == 409:
+        return "approval_replayed"
+    return "approval_token_unavailable"
+
+
+def _raise_redeem_denied(
+    client: SigilClient,
+    reason: str,
+    *,
+    agent_id: str,
+    task_id: str,
+    tool_fqn: str,
+    namespace: str,
+    ah: str,
+    risk_tier: str,
+    args_redacted: Any,
+) -> NoReturn:
+    """Push a denied audit event and raise SigilDeniedError for a failed redemption.
+    A governed call must NEVER proceed without a confirmed single-use redemption (#ENT-82)."""
+    ev = _make_event(
+        agent_id, task_id, tool_fqn, namespace, ah, 0, "denied", risk_tier,
+        denied_reason=reason, args_redacted=args_redacted,
+    )
+    client._log_buffer.push(ev)
+    raise SigilDeniedError(
+        f"Approval redemption for '{tool_fqn}' failed: {reason}",
+        denied_reason=reason,
+        tool_name=tool_fqn,
+        task_id=task_id,
+    )
+
+
+def _redeem_approval(
+    client: SigilClient,
+    approval_id: str,
+    token: str,
+    *,
+    agent_id: str,
+    task_id: str,
+    tool_fqn: str,
+    namespace: str,
+    ah: str,
+    risk_tier: str,
+    args_redacted: Any,
+) -> str:
+    """Redeem an APPROVED gate for a one-shot single-use grant; return its revocation_id.
+
+    Called once after :func:`_finalize_approval` confirms ``"approved"``. ANY failure
+    (already redeemed, unreachable, malformed) fails CLOSED: a denied event is emitted and
+    :class:`SigilDeniedError` raised — the governed call does not run. The returned grant id
+    is recorded on the execution audit event as proof of a fresh, human-approved grant."""
+    try:
+        result = client.redeem_approval(approval_id, token)
+    except Exception as exc:  # noqa: BLE001
+        _raise_redeem_denied(
+            client, _redeem_denied_reason(exc),
+            agent_id=agent_id, task_id=task_id, tool_fqn=tool_fqn,
+            namespace=namespace, ah=ah, risk_tier=risk_tier, args_redacted=args_redacted,
+        )
+    else:
+        # `result` is provably bound here (the except branch is NoReturn). Using `else`
+        # makes that unambiguous and robust against future refactors of the raise helper.
+        revocation_id = str(result.get("revocation_id") or "")
+        if not revocation_id:
+            # Defence-in-depth: client.redeem_approval already raises on a missing grant id,
+            # but a governed call must never proceed without proof of a single-use redemption.
+            _raise_redeem_denied(
+                client, "approval_token_unavailable",
+                agent_id=agent_id, task_id=task_id, tool_fqn=tool_fqn,
+                namespace=namespace, ah=ah, risk_tier=risk_tier, args_redacted=args_redacted,
+            )
+        return revocation_id
+
+
+async def _redeem_approval_async(
+    client: SigilClient,
+    approval_id: str,
+    token: str,
+    *,
+    agent_id: str,
+    task_id: str,
+    tool_fqn: str,
+    namespace: str,
+    ah: str,
+    risk_tier: str,
+    args_redacted: Any,
+) -> str:
+    """Native-async variant of :func:`_redeem_approval` (#311 pattern): offload only the
+    single blocking redeem HTTP call to a thread so the event loop is not stalled."""
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(None, client.redeem_approval, approval_id, token)
+    except Exception as exc:  # noqa: BLE001
+        _raise_redeem_denied(
+            client, _redeem_denied_reason(exc),
+            agent_id=agent_id, task_id=task_id, tool_fqn=tool_fqn,
+            namespace=namespace, ah=ah, risk_tier=risk_tier, args_redacted=args_redacted,
+        )
+    else:
+        # `result` is provably bound here (the except branch is NoReturn). Using `else`
+        # makes that unambiguous and robust against future refactors of the raise helper.
+        revocation_id = str(result.get("revocation_id") or "")
+        if not revocation_id:
+            # Defence-in-depth: client.redeem_approval already raises on a missing grant id,
+            # but a governed call must never proceed without proof of a single-use redemption.
+            _raise_redeem_denied(
+                client, "approval_token_unavailable",
+                agent_id=agent_id, task_id=task_id, tool_fqn=tool_fqn,
+                namespace=namespace, ah=ah, risk_tier=risk_tier, args_redacted=args_redacted,
+            )
+        return revocation_id
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # I-3: shared execute+audit helpers (extracted from the 4-way inline shell)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -599,6 +722,7 @@ def _execute_audit(
     risk_tier: str,
     fail_open: bool,
     args_redacted: Any,
+    approval_grant_id: str | None = None,
 ) -> Any:
     """Execute *fn* synchronously, time it, and emit one audit event in all cases.
 
@@ -626,6 +750,7 @@ def _execute_audit(
             risk_tier,
             args_redacted=args_redacted,
             fail_open=fail_open,
+            approval_grant_id=approval_grant_id,
         )
         client._log_buffer.push(ev)
 
@@ -644,6 +769,7 @@ async def _async_execute_audit(
     risk_tier: str,
     fail_open: bool,
     args_redacted: Any,
+    approval_grant_id: str | None = None,
 ) -> Any:
     """Async variant of ``_execute_audit`` — awaits *fn* and emits audit in finally."""
     t0 = time.monotonic()
@@ -667,6 +793,7 @@ async def _async_execute_audit(
             risk_tier,
             args_redacted=args_redacted,
             fail_open=fail_open,
+            approval_grant_id=approval_grant_id,
         )
         client._log_buffer.push(ev)
 
@@ -762,11 +889,25 @@ def instrumented_tool(
                 # Only the individual status calls are offloaded per-poll; the idle waits
                 # run on the event loop, so no executor thread is pinned for the (up to
                 # 300s) approval window.
+                approval_grant_id: str | None = None
                 if approval_id is not None:
                     outcome = await _poll_approval_async(client, approval_id)
                     _finalize_approval(
                         client,
                         outcome,
+                        agent_id=agent_id,
+                        task_id=task_id,
+                        tool_fqn=tool_fqn,
+                        namespace=namespace,
+                        ah=ah,
+                        risk_tier=risk_tier,
+                        args_redacted=None,
+                    )
+                    # ENT-82: approved → redeem once for a one-shot single-use grant (fail-closed).
+                    approval_grant_id = await _redeem_approval_async(
+                        client,
+                        approval_id,
+                        task._biscuit_token or "",
                         agent_id=agent_id,
                         task_id=task_id,
                         tool_fqn=tool_fqn,
@@ -790,6 +931,7 @@ def instrumented_tool(
                     risk_tier=risk_tier,
                     fail_open=fail_open,
                     args_redacted=None,
+                    approval_grant_id=approval_grant_id,
                 )
 
             return async_wrapper  # type: ignore[return-value]
@@ -821,11 +963,25 @@ def instrumented_tool(
 
             # ENT-81 (#311): "approve" verdict → block-poll the approval (sync path).
             # _finalize_approval turns the outcome into a fall-through or fail-closed deny.
+            approval_grant_id: str | None = None
             if approval_id is not None:
                 outcome = _poll_approval(client, approval_id)
                 _finalize_approval(
                     client,
                     outcome,
+                    agent_id=agent_id,
+                    task_id=task_id,
+                    tool_fqn=tool_fqn,
+                    namespace=namespace,
+                    ah=ah,
+                    risk_tier=risk_tier,
+                    args_redacted=None,
+                )
+                # ENT-82: approved → redeem once for a one-shot single-use grant (fail-closed).
+                approval_grant_id = _redeem_approval(
+                    client,
+                    approval_id,
+                    task._biscuit_token or "",
                     agent_id=agent_id,
                     task_id=task_id,
                     tool_fqn=tool_fqn,
@@ -849,6 +1005,7 @@ def instrumented_tool(
                 risk_tier=risk_tier,
                 fail_open=fail_open,
                 args_redacted=None,
+                approval_grant_id=approval_grant_id,
             )
 
         return wrapper  # type: ignore[return-value]
@@ -939,11 +1096,25 @@ def instrumented_llm(
                 # Only the individual status calls are offloaded per-poll; the idle waits
                 # run on the event loop, so no executor thread is pinned for the (up to
                 # 300s) approval window.
+                approval_grant_id: str | None = None
                 if approval_id is not None:
                     outcome = await _poll_approval_async(client, approval_id)
                     _finalize_approval(
                         client,
                         outcome,
+                        agent_id=agent_id,
+                        task_id=task_id,
+                        tool_fqn=tool_fqn,
+                        namespace=namespace,
+                        ah=ah,
+                        risk_tier=risk_tier,
+                        args_redacted=redacted,
+                    )
+                    # ENT-82: approved → redeem once for a one-shot single-use grant (fail-closed).
+                    approval_grant_id = await _redeem_approval_async(
+                        client,
+                        approval_id,
+                        task._biscuit_token or "",
                         agent_id=agent_id,
                         task_id=task_id,
                         tool_fqn=tool_fqn,
@@ -967,6 +1138,7 @@ def instrumented_llm(
                     risk_tier=risk_tier,
                     fail_open=fail_open,
                     args_redacted=redacted,
+                    approval_grant_id=approval_grant_id,
                 )
 
             return async_wrapper  # type: ignore[return-value]
@@ -999,11 +1171,25 @@ def instrumented_llm(
 
             # ENT-81 (#311): "approve" verdict → block-poll the approval (sync path).
             # _finalize_approval turns the outcome into a fall-through or fail-closed deny.
+            approval_grant_id: str | None = None
             if approval_id is not None:
                 outcome = _poll_approval(client, approval_id)
                 _finalize_approval(
                     client,
                     outcome,
+                    agent_id=agent_id,
+                    task_id=task_id,
+                    tool_fqn=tool_fqn,
+                    namespace=namespace,
+                    ah=ah,
+                    risk_tier=risk_tier,
+                    args_redacted=redacted,
+                )
+                # ENT-82: approved → redeem once for a one-shot single-use grant (fail-closed).
+                approval_grant_id = _redeem_approval(
+                    client,
+                    approval_id,
+                    task._biscuit_token or "",
                     agent_id=agent_id,
                     task_id=task_id,
                     tool_fqn=tool_fqn,
@@ -1027,6 +1213,7 @@ def instrumented_llm(
                 risk_tier=risk_tier,
                 fail_open=fail_open,
                 args_redacted=redacted,
+                approval_grant_id=approval_grant_id,
             )
 
         return wrapper  # type: ignore[return-value]

@@ -732,6 +732,70 @@ class SigilClient:
             )
         return status
 
+    def redeem_approval(self, approval_id: str, token: str) -> dict[str, Any]:
+        """Redeem an APPROVED approval for a one-shot, single-use grant (ENT-82/SG-4).
+
+        ``POST {base}/internal/v1/sigil/toolgate/approval/{id}/redeem``
+
+        Call this exactly once after :meth:`approval_status` returns ``"approved"``.
+        sigil-core derives the approved tool + agent from the approval record (never from
+        this call), verifies *token* authorizes that tool and belongs to that agent, and
+        atomically consumes a single-use nonce before minting a tool-scoped, short-TTL
+        one-shot token. The response's ``revocation_id`` is the cryptographic proof that
+        the call ran under a fresh, human-approved, single-use grant.
+
+        Args:
+            approval_id: the ``approval_id`` returned by :meth:`preflight`.
+            token: the active Biscuit task token (the parent to attenuate). Never logged.
+
+        Returns:
+            dict with ``one_shot_token``, ``revocation_id``, ``expires_at``, ``tool_name``.
+
+        Raises:
+            :class:`~sigil.errors.SigilTransportError`: on network failure.
+            :class:`~sigil.errors.SigilAPIError`: on any non-200 (409 = already redeemed;
+                403/404/502/503 = not redeemable / unavailable). The caller MUST fail
+                closed (deny) on either — a governed call must never proceed without a
+                confirmed single-use redemption. The ``status_code`` distinguishes 409.
+        """
+        url = (
+            f"{self.base_url}/internal/v1/sigil/toolgate/approval/"
+            f"{quote(approval_id, safe='')}/redeem"
+        )
+        try:
+            resp = self._session.post(
+                url,
+                headers=self._toolgate_headers(),
+                json={"token": token},
+                timeout=self.timeout,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise SigilTransportError(
+                "redeem_approval: transport error reaching sigil-core",
+                method="POST",
+                url=url,
+            ) from exc
+
+        if resp.status_code != 200:
+            raise SigilAPIError(
+                f"redeem_approval: expected 200, got {resp.status_code}",
+                status_code=resp.status_code,
+            )
+        try:
+            result: dict[str, Any] = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            raise SigilAPIError(
+                f"redeem_approval: response body is not valid JSON (status={resp.status_code})",
+                status_code=resp.status_code,
+            ) from exc
+        if not str(result.get("revocation_id") or ""):
+            # No grant proof → treat as a failed redemption (fail-closed at the call site).
+            raise SigilAPIError(
+                "redeem_approval: response missing 'revocation_id'",
+                status_code=resp.status_code,
+            )
+        return result
+
     def log_batch(self, events: list[dict[str, Any]]) -> dict[str, Any]:
         """Flush a batch of audit events to sigil-core.
 

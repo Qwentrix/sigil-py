@@ -1726,6 +1726,12 @@ class TestApprovalGate:
             ),
             patch.object(client, "preflight", return_value=preflight_ret),
             patch.object(client, "approval_status", **status_kw) as mock_status,
+            # ENT-82: the approved path redeems for a one-shot grant; mock it so approved
+            # tests execute. Denial-path tests never reach redeem (they deny at finalize).
+            patch.object(
+                client, "redeem_approval",
+                return_value={"revocation_id": "grant-ok", "one_shot_token": "t"},
+            ),
             patch.object(client, "log_batch", return_value={"accepted": 1}),
             client.task(["ns.dangerous"]),
         ):
@@ -1739,6 +1745,93 @@ class TestApprovalGate:
             with self._gate(client, biscuit, self._APPROVE, "approved") as (call, mock_status):
                 assert call() == "ok"
                 mock_status.assert_called()
+        finally:
+            client.close()
+
+    def test_approve_redeem_replayed_denies(self, sk: SigningKey, tmp_path: Any) -> None:
+        """ENT-82: a 409 from redeem (approval already redeemed) fails CLOSED — the tool
+        does NOT execute and the denial reason is approval_replayed."""
+        client, biscuit = self._client(sk, tmp_path)
+
+        @instrumented_tool("ns", "dangerous", risk_tier="high")
+        def call() -> str:
+            return "ok"
+
+        try:
+            with (
+                patch.object(
+                    client._session, "post", return_value=_mock_response(201, _issue_resp(biscuit))
+                ),
+                patch.object(client, "preflight", return_value=self._APPROVE),
+                patch.object(client, "approval_status", return_value="approved"),
+                patch.object(
+                    client, "redeem_approval",
+                    side_effect=SigilAPIError("already redeemed", status_code=409),
+                ),
+                patch.object(client, "log_batch", return_value={"accepted": 1}),
+                client.task(["ns.dangerous"]),
+            ):
+                with pytest.raises(SigilDeniedError) as exc:
+                    call()
+                assert exc.value.denied_reason == "approval_replayed"
+        finally:
+            client.close()
+
+    def test_approve_redeem_unavailable_denies(self, sk: SigningKey, tmp_path: Any) -> None:
+        """ENT-82: a transport failure on redeem fails CLOSED with approval_token_unavailable."""
+        client, biscuit = self._client(sk, tmp_path)
+
+        @instrumented_tool("ns", "dangerous", risk_tier="high")
+        def call() -> str:
+            return "ok"
+
+        try:
+            with (
+                patch.object(
+                    client._session, "post", return_value=_mock_response(201, _issue_resp(biscuit))
+                ),
+                patch.object(client, "preflight", return_value=self._APPROVE),
+                patch.object(client, "approval_status", return_value="approved"),
+                patch.object(
+                    client, "redeem_approval",
+                    side_effect=SigilTransportError("down", method="POST", url="http://x/"),
+                ),
+                patch.object(client, "log_batch", return_value={"accepted": 1}),
+                client.task(["ns.dangerous"]),
+            ):
+                with pytest.raises(SigilDeniedError) as exc:
+                    call()
+                assert exc.value.denied_reason == "approval_token_unavailable"
+        finally:
+            client.close()
+
+    def test_approve_grant_id_recorded_in_audit(self, sk: SigningKey, tmp_path: Any) -> None:
+        """ENT-82: on a redeemed approval the execution audit event carries the one-shot
+        grant's revocation_id as proof the call ran under a fresh single-use grant."""
+        client, biscuit = self._client(sk, tmp_path)
+        captured: list[dict[str, Any]] = []
+
+        @instrumented_tool("ns", "dangerous", risk_tier="high")
+        def call() -> str:
+            return "ok"
+
+        try:
+            with (
+                patch.object(
+                    client._session, "post", return_value=_mock_response(201, _issue_resp(biscuit))
+                ),
+                patch.object(client, "preflight", return_value=self._APPROVE),
+                patch.object(client, "approval_status", return_value="approved"),
+                patch.object(
+                    client, "redeem_approval",
+                    return_value={"revocation_id": "rev-xyz", "one_shot_token": "t"},
+                ),
+                patch.object(client._log_buffer, "push", side_effect=captured.append),
+                client.task(["ns.dangerous"]),
+            ):
+                assert call() == "ok"
+            allowed = next(e for e in captured if e.get("outcome") == "allowed")
+            assert allowed.get("approval_grant_id") == "rev-xyz"
         finally:
             client.close()
 
@@ -1789,7 +1882,9 @@ class TestApprovalGate:
         client, biscuit = self._client(sk, tmp_path)
         try:
             # approve verdict but no approval_id → never poll; fail closed immediately.
-            with self._gate(client, biscuit, {"verdict": "approve"}, "approved") as (call, mock_status):
+            with self._gate(
+                client, biscuit, {"verdict": "approve"}, "approved"
+            ) as (call, mock_status):
                 with pytest.raises(SigilDeniedError) as exc:
                     call()
                 assert exc.value.denied_reason == "approval_service_unavailable"

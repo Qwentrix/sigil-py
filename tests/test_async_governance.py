@@ -545,6 +545,10 @@ class TestAsyncApprovalGate:
                     client, "preflight", return_value={"verdict": "approve", "approval_id": "ap-1"}
                 ),
                 patch.object(client, "approval_status", return_value="approved"),
+                patch.object(
+                    client, "redeem_approval",
+                    return_value={"revocation_id": "grant-ok", "one_shot_token": "t"},
+                ),
                 patch.object(client, "log_batch", return_value={"accepted": 1}),
                 client.task(["ns.danger"]),
             ):
@@ -580,6 +584,71 @@ class TestAsyncApprovalGate:
         finally:
             client.close()
 
+    async def test_async_approve_redeem_replayed_denies(
+        self, sk: SigningKey, tmp_path: Any
+    ) -> None:
+        """ENT-82 (async): a 409 from redeem fails closed with approval_replayed."""
+        client, biscuit = self._client(sk, tmp_path)
+
+        @instrumented_tool("ns", "danger", risk_tier="high")
+        async def danger() -> str:
+            return "ok"
+
+        try:
+            with (
+                patch.object(
+                    client._session, "post", return_value=_mock_response(201, _issue_resp(biscuit))
+                ),
+                patch.object(
+                    client, "preflight", return_value={"verdict": "approve", "approval_id": "ap-1"}
+                ),
+                patch.object(client, "approval_status", return_value="approved"),
+                patch.object(
+                    client, "redeem_approval",
+                    side_effect=SigilAPIError("already redeemed", status_code=409),
+                ),
+                patch.object(client, "log_batch", return_value={"accepted": 1}),
+                client.task(["ns.danger"]),
+            ):
+                with pytest.raises(SigilDeniedError) as exc:
+                    await danger()
+                assert exc.value.denied_reason == "approval_replayed"
+        finally:
+            client.close()
+
+    async def test_async_approve_redeem_unavailable_denies(
+        self, sk: SigningKey, tmp_path: Any
+    ) -> None:
+        """ENT-82 (async): a transport failure on redeem fails closed with
+        approval_token_unavailable — the propagation through run_in_executor still denies."""
+        client, biscuit = self._client(sk, tmp_path)
+
+        @instrumented_tool("ns", "danger", risk_tier="high")
+        async def danger() -> str:
+            return "ok"
+
+        try:
+            with (
+                patch.object(
+                    client._session, "post", return_value=_mock_response(201, _issue_resp(biscuit))
+                ),
+                patch.object(
+                    client, "preflight", return_value={"verdict": "approve", "approval_id": "ap-1"}
+                ),
+                patch.object(client, "approval_status", return_value="approved"),
+                patch.object(
+                    client, "redeem_approval",
+                    side_effect=SigilTransportError("down", method="POST", url="http://x/"),
+                ),
+                patch.object(client, "log_batch", return_value={"accepted": 1}),
+                client.task(["ns.danger"]),
+            ):
+                with pytest.raises(SigilDeniedError) as exc:
+                    await danger()
+                assert exc.value.denied_reason == "approval_token_unavailable"
+        finally:
+            client.close()
+
     async def test_async_approve_polls_natively_via_asyncio_sleep(
         self, sk: SigningKey, tmp_path: Any
     ) -> None:
@@ -603,6 +672,10 @@ class TestAsyncApprovalGate:
                     client, "preflight", return_value={"verdict": "approve", "approval_id": "ap-1"}
                 ),
                 patch.object(client, "approval_status", side_effect=["pending", "approved"]),
+                patch.object(
+                    client, "redeem_approval",
+                    return_value={"revocation_id": "grant-ok", "one_shot_token": "t"},
+                ),
                 patch.object(client, "log_batch", return_value={"accepted": 1}),
                 patch("sigil.decorators.asyncio.sleep", new=AsyncMock()) as mock_asleep,
                 patch("sigil.decorators.time.sleep") as mock_tsleep,
