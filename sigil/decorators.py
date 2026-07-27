@@ -47,6 +47,7 @@ import asyncio
 import functools
 import inspect
 import logging
+import math
 import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, NoReturn, TypeVar
@@ -85,6 +86,78 @@ def _raw_args(args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
     return {"args": list(args), "kwargs": kwargs}
 
 
+def _extract_prompt(args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
+    """Extract the prompt text from the call arguments of an instrumented LLM call.
+
+    Handles four common LLM SDK calling conventions without ever raising:
+
+    (a) Positional string — ``fn("hello")`` → ``args[0]`` is a ``str``.
+    (b) Positional messages list — ``fn([{"role": "user", "content": "..."}])``
+        → join the ``"content"`` fields of all dicts that have one.
+    (c) Named scalar kwarg — ``fn(prompt="…")`` / ``fn(input="…")`` /
+        ``fn(content="…")`` → return the first matching str kwarg.
+    (d) Named messages kwarg — ``fn(messages=[{"role": "user", "content": "…"}])``
+        → join the ``"content"`` fields (same logic as (b)).
+
+    Returns ``""`` for any unrecognised shape so entropy gracefully falls back to
+    0.0 rather than crashing the governed call.
+
+    Fully typed and ruff/mypy-strict compatible.
+    """
+    try:
+        # (a) positional string
+        if args and isinstance(args[0], str):
+            return args[0]
+        # (b) positional messages list
+        if args and isinstance(args[0], list):
+            parts: list[str] = []
+            for msg in args[0]:
+                if isinstance(msg, dict):
+                    c = msg.get("content")
+                    if isinstance(c, str):
+                        parts.append(c)
+            return "\n".join(parts)
+        # (c) named scalar kwarg: prompt | input | content
+        for key in ("prompt", "input", "content"):
+            val = kwargs.get(key)
+            if isinstance(val, str):
+                return val
+        # (d) named messages kwarg
+        msgs = kwargs.get("messages")
+        if isinstance(msgs, list):
+            parts = []
+            for msg in msgs:
+                if isinstance(msg, dict):
+                    c = msg.get("content")
+                    if isinstance(c, str):
+                        parts.append(c)
+            return "\n".join(parts)
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def _shannon_entropy(text: str) -> float:
+    """Return base-2 Shannon entropy over the character frequency of *text*.
+
+    Empty or all-whitespace input returns 0.0.  The result is in bits (log base
+    2), which is the conventional unit for prompt-entropy signalling.
+
+    Example::
+
+        _shannon_entropy("aaaa")   # → 0.0  (single symbol)
+        _shannon_entropy("abcd")   # → 2.0  (four equally-likely symbols)
+    """
+    stripped = text.strip()
+    if not stripped:
+        return 0.0
+    length = len(stripped)
+    freq: dict[str, int] = {}
+    for ch in stripped:
+        freq[ch] = freq.get(ch, 0) + 1
+    return -sum((c / length) * math.log2(c / length) for c in freq.values())
+
+
 def _make_event(
     agent_id: str,
     task_id: str,
@@ -99,6 +172,7 @@ def _make_event(
     args_redacted: Any = None,
     fail_open: bool = False,
     approval_grant_id: str | None = None,
+    prompt_entropy: float = 0.0,
 ) -> dict[str, Any]:
     """Build an audit event dict conforming to docs/protocol.md §4.1."""
     ev: dict[str, Any] = {
@@ -110,6 +184,7 @@ def _make_event(
         "latency_ms": latency_ms,
         "outcome": outcome,
         "risk_tier": risk_tier,
+        "prompt_entropy": prompt_entropy,
     }
     if denied_reason is not None:
         ev["denied_reason"] = denied_reason
@@ -723,6 +798,7 @@ def _execute_audit(
     fail_open: bool,
     args_redacted: Any,
     approval_grant_id: str | None = None,
+    prompt_entropy: float = 0.0,
 ) -> Any:
     """Execute *fn* synchronously, time it, and emit one audit event in all cases.
 
@@ -751,6 +827,7 @@ def _execute_audit(
             args_redacted=args_redacted,
             fail_open=fail_open,
             approval_grant_id=approval_grant_id,
+            prompt_entropy=prompt_entropy,
         )
         client._log_buffer.push(ev)
 
@@ -770,6 +847,7 @@ async def _async_execute_audit(
     fail_open: bool,
     args_redacted: Any,
     approval_grant_id: str | None = None,
+    prompt_entropy: float = 0.0,
 ) -> Any:
     """Async variant of ``_execute_audit`` — awaits *fn* and emits audit in finally."""
     t0 = time.monotonic()
@@ -794,6 +872,7 @@ async def _async_execute_audit(
             args_redacted=args_redacted,
             fail_open=fail_open,
             approval_grant_id=approval_grant_id,
+            prompt_entropy=prompt_entropy,
         )
         client._log_buffer.push(ev)
 
@@ -1074,6 +1153,10 @@ def instrumented_llm(
                 ah = args_hash(raw)  # over UNREDACTED original
                 redacted = redact_safe(raw)  # DLP-scrubbed copy for audit log
 
+                # SG-5: extract prompt text using the robust helper (handles str,
+                # messages-list, and kwarg calling conventions) then compute entropy.
+                entropy = _shannon_entropy(_extract_prompt(args, kwargs))
+
                 # ── Steps 2-4: governance offloaded to thread (I-1) ───────────
                 fail_open, approval_id = await asyncio.get_running_loop().run_in_executor(
                     None,
@@ -1139,6 +1222,7 @@ def instrumented_llm(
                     fail_open=fail_open,
                     args_redacted=redacted,
                     approval_grant_id=approval_grant_id,
+                    prompt_entropy=entropy,
                 )
 
             return async_wrapper  # type: ignore[return-value]
@@ -1154,6 +1238,10 @@ def instrumented_llm(
             raw = _raw_args(args, kwargs)
             ah = args_hash(raw)  # over UNREDACTED original
             redacted = redact_safe(raw)  # DLP-scrubbed copy for audit log
+
+            # SG-5: extract prompt text using the robust helper (handles str,
+            # messages-list, and kwarg calling conventions) then compute entropy.
+            entropy = _shannon_entropy(_extract_prompt(args, kwargs))
 
             # ── Steps 2-4: governance (shared helper) ─────────────────────────
             fail_open, approval_id = _governance_check(
@@ -1214,6 +1302,7 @@ def instrumented_llm(
                 fail_open=fail_open,
                 args_redacted=redacted,
                 approval_grant_id=approval_grant_id,
+                prompt_entropy=entropy,
             )
 
         return wrapper  # type: ignore[return-value]
