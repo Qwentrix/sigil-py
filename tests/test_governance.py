@@ -29,6 +29,7 @@ from nacl.signing import SigningKey
 from sigil.client import SigilClient
 from sigil.decorators import instrumented_llm, instrumented_tool
 from sigil.errors import (
+    AgentQuarantinedError,
     SigilAPIError,
     SigilDeniedError,
     SigilTransportError,
@@ -441,6 +442,77 @@ class TestAC6HighRiskPreflight:
                 mock_preflight.assert_called_once()
                 assert exc_info.value.denied_reason == "policy_deny"
                 assert exc_info.value.tool_name == "ns.dangerous"
+        finally:
+            client.close()
+
+    def test_quarantine_denial_raises_terminal_error(
+        self, sk: SigningKey, tmp_path: Any
+    ) -> None:
+        """SG-6 (ENT-86c): a cascade-revocation denial raises the terminal
+        AgentQuarantinedError (a SigilDeniedError subclass) so retry wrappers stop."""
+        client, biscuit = _make_client(sk, ["ns.dangerous"], overflow_dir=str(tmp_path))
+
+        @instrumented_tool("ns", "dangerous", risk_tier="high")
+        def dangerous_call() -> str:
+            return "ok"
+
+        issue_resp = _issue_resp(biscuit)
+
+        try:
+            for reason in ("agent_quarantined", "agent_revoked_anomaly"):
+                with (
+                    patch.object(
+                        client._session, "post", return_value=_mock_response(201, issue_resp)
+                    ),
+                    patch.object(
+                        client,
+                        "preflight",
+                        return_value={"verdict": "deny", "denied_reason": reason},
+                    ),
+                ):
+                    with (
+                        client.task(["ns.dangerous"]) as _task,
+                        pytest.raises(AgentQuarantinedError) as exc_info,
+                    ):
+                        dangerous_call()
+
+                    # It is a distinct terminal type AND still a SigilDeniedError,
+                    # carrying the full denied_reason / tool_name / task_id contract.
+                    assert isinstance(exc_info.value, SigilDeniedError)
+                    assert exc_info.value.denied_reason == reason
+                    assert exc_info.value.tool_name == "ns.dangerous"
+                    assert exc_info.value.task_id == _task.task_id
+        finally:
+            client.close()
+
+    def test_non_quarantine_denial_is_not_terminal_error(
+        self, sk: SigningKey, tmp_path: Any
+    ) -> None:
+        """A plain policy_deny must NOT be an AgentQuarantinedError (retryable class)."""
+        client, biscuit = _make_client(sk, ["ns.dangerous"], overflow_dir=str(tmp_path))
+
+        @instrumented_tool("ns", "dangerous", risk_tier="high")
+        def dangerous_call() -> str:
+            return "ok"
+
+        issue_resp = _issue_resp(biscuit)
+        try:
+            with (
+                patch.object(
+                    client._session, "post", return_value=_mock_response(201, issue_resp)
+                ),
+                patch.object(
+                    client,
+                    "preflight",
+                    return_value={"verdict": "deny", "denied_reason": "policy_deny"},
+                ),
+            ):
+                with (
+                    client.task(["ns.dangerous"]) as _task,
+                    pytest.raises(SigilDeniedError) as exc_info,
+                ):
+                    dangerous_call()
+                assert not isinstance(exc_info.value, AgentQuarantinedError)
         finally:
             client.close()
 

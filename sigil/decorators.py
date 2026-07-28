@@ -54,6 +54,8 @@ from typing import TYPE_CHECKING, Any, NoReturn, TypeVar
 
 from sigil._context import _current_task
 from sigil.errors import (
+    TERMINAL_QUARANTINE_REASONS,
+    AgentQuarantinedError,
     SigilAPIError,
     SigilDeniedError,
     SigilTransportError,
@@ -523,7 +525,21 @@ def _governance_check(
                     args_redacted=args_redacted,
                 )
                 client._log_buffer.push(ev)
-                raise SigilDeniedError(
+                # SG-6 (ENT-86c): a cascade-revocation containment surfaced on the preflight
+                # deny path is TERMINAL — raise the distinct AgentQuarantinedError so a caller's
+                # retry/backoff wrapper stops rather than hammering a permanently-denying
+                # endpoint. Subclass of SigilDeniedError, so existing handlers still catch it.
+                # Scope: this is the preflight deny path only. A generic kill-switch revocation
+                # (Step 2 in-memory subscriber) is a separate signal that stays "agent_revoked".
+                # Trim+lower the server reason before matching so a stray-cased/whitespaced value
+                # still classifies terminal (fail-safe: a miss only downgrades to the retryable
+                # base class — it never turns a deny into an allow).
+                err_cls = (
+                    AgentQuarantinedError
+                    if reason.strip().lower() in TERMINAL_QUARANTINE_REASONS
+                    else SigilDeniedError
+                )
+                raise err_cls(
                     f"Preflight denied '{tool_fqn}': {reason}",
                     denied_reason=reason,
                     tool_name=tool_fqn,

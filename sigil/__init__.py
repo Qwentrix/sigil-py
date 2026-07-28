@@ -30,6 +30,8 @@ Kill-switch: subscribe to drm:revocation-events:{tenant_id} via SIGIL_REDIS_URL.
 from sigil.client import SigilClient, SigilTaskContext
 from sigil.decorators import instrumented_llm, instrumented_tool
 from sigil.errors import (
+    TERMINAL_QUARANTINE_REASONS,
+    AgentQuarantinedError,
     SigilAPIError,
     SigilDeniedError,
     SigilTransportError,
@@ -44,6 +46,8 @@ __all__ = [
     "instrumented_llm",
     "SigilDeniedError",
     "SigilUnreachableDeniedError",
+    "AgentQuarantinedError",
+    "TERMINAL_QUARANTINE_REASONS",
     "SigilTransportError",
     "SigilAPIError",
     "verify_local",

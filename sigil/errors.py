@@ -35,6 +35,35 @@ class SigilUnreachableDeniedError(SigilDeniedError):
     """
 
 
+# SG-6 (ENT-86c): denial reasons that mean the agent has been CONTAINED by the
+# cascade-revocation pipeline. These are TERMINAL — the agent's session content
+# keys are quarantined / crypto-erased server-side, so every subsequent governed
+# call for this agent will keep being denied. Retrying only hammers a
+# permanently-denying endpoint. Keep in sync with shared/sigilreason and the
+# @qwentrix/sigil SDK.
+TERMINAL_QUARANTINE_REASONS: frozenset[str] = frozenset(
+    {"agent_quarantined", "agent_revoked_anomaly"}
+)
+
+
+class AgentQuarantinedError(SigilDeniedError):
+    """Raised when a tool call is denied because the agent has been contained by
+    SG-6 cascade revocation (``denied_reason`` in
+    :data:`TERMINAL_QUARANTINE_REASONS`).
+
+    Subclasses :class:`SigilDeniedError` so existing ``except SigilDeniedError``
+    handlers keep working, but it is a **distinct, terminal** type: a retry /
+    backoff wrapper should recognise it and STOP re-issuing the call (and
+    typically halt the agent), because the containment is server-side and
+    permanent — no amount of retrying will succeed.
+
+    Deliberately no ``__init__`` override: it is a transparent pass-through of
+    :class:`SigilDeniedError`'s constructor (same ``denied_reason`` / ``tool_name``
+    / ``task_id`` attributes). The terminal semantics live in the type, not the
+    fields — unlike :class:`SigilUnreachableDeniedError`, which fixes its reason.
+    """
+
+
 class SigilTransportError(Exception):
     """Raised when an HTTP call to sigil-core fails at the transport level.
 
