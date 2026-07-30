@@ -32,6 +32,7 @@ from sigil.decorators import instrumented_llm, instrumented_tool
 from sigil.errors import (
     TERMINAL_QUARANTINE_REASONS,
     AgentQuarantinedError,
+    CredentialRotatedError,
     SigilAPIError,
     SigilDeniedError,
     SigilTransportError,
@@ -47,6 +48,7 @@ __all__ = [
     "SigilDeniedError",
     "SigilUnreachableDeniedError",
     "AgentQuarantinedError",
+    "CredentialRotatedError",
     "TERMINAL_QUARANTINE_REASONS",
     "SigilTransportError",
     "SigilAPIError",

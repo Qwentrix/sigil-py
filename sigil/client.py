@@ -26,6 +26,7 @@ import logging
 import math
 import os
 import uuid
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 from urllib.parse import quote, urlparse
 
@@ -35,7 +36,7 @@ from sigil._buffer import _Flusher, _LogBuffer
 from sigil._context import _current_task
 from sigil._overflow import _OverflowWriter
 from sigil._subscriber import _RevocationSubscriber
-from sigil.errors import SigilAPIError, SigilTransportError
+from sigil.errors import CredentialRotatedError, SigilAPIError, SigilTransportError
 from sigil.verify import VerifyResult, verify_local
 
 if TYPE_CHECKING:
@@ -258,6 +259,7 @@ class SigilClient:
         timeout: float = 5.0,
         approval_timeout: float = 300.0,
         approval_poll_interval: float = 2.0,
+        credential_near_expiry_seconds: float = 604800.0,  # 7 days
         overflow_dir: str | None = None,
     ) -> None:
         self.base_url: str = (
@@ -299,6 +301,25 @@ class SigilClient:
             if os.environ.get("SIGIL_APPROVAL_POLL_INTERVAL") is None
             else os.environ["SIGIL_APPROVAL_POLL_INTERVAL"]
         )
+        # SG-7 (ENT-94c) near-expiry warning: when a token-issue response carries the agent
+        # credential's effective "valid until" (credential_expires_at — present only once the
+        # server's credential-lifecycle feature is enabled), warn if it is within this many
+        # seconds, so the operator can rotate before the credential stops working. Default 7 days.
+        _near_expiry_raw = (
+            credential_near_expiry_seconds
+            if os.environ.get("SIGIL_CREDENTIAL_NEAR_EXPIRY_SECONDS") is None
+            else os.environ["SIGIL_CREDENTIAL_NEAR_EXPIRY_SECONDS"]
+        )
+        try:
+            self.credential_near_expiry_seconds: float = float(_near_expiry_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "credential_near_expiry_seconds (SIGIL_CREDENTIAL_NEAR_EXPIRY_SECONDS) must be a "
+                f"number, got {_near_expiry_raw!r}"
+            ) from exc
+        # Dedup: warn at most once per distinct credential expiry so per-task issuance does not
+        # flood logs. A rotation/renewal changes the timestamp and re-arms the warning.
+        self._near_expiry_warned: set[str] = set()
         self.biscuit_keyring: dict[str, bytes] = (
             biscuit_keyring if biscuit_keyring is not None else _parse_biscuit_keyring()
         )
@@ -318,6 +339,8 @@ class SigilClient:
             raise ValueError("approval_timeout must be a finite number > 0")
         if not math.isfinite(self.approval_poll_interval) or self.approval_poll_interval <= 0:
             raise ValueError("approval_poll_interval must be a finite number > 0")
+        if not math.isfinite(self.credential_near_expiry_seconds) or self.credential_near_expiry_seconds < 0:
+            raise ValueError("credential_near_expiry_seconds must be a finite number >= 0")
         if not self._internal_token:
             raise ValueError(
                 "internal_token is required. " "Pass it directly or set SIGIL_SDK_TOKEN."
@@ -574,6 +597,20 @@ class SigilClient:
             ) from exc
 
         if resp.status_code != 201:
+            # SG-7 (ENT-94c): a 422 with code="credential_rejected" means the agent's credential
+            # has been rotated past its grace window or expired under enforcement. Surface a
+            # distinct TERMINAL error so retry wrappers stop and the operator rotates the config.
+            if resp.status_code == 422:
+                try:
+                    err_body = resp.json()
+                except Exception:  # noqa: BLE001
+                    err_body = {}
+                if isinstance(err_body, dict) and err_body.get("code") == "credential_rejected":
+                    raise CredentialRotatedError(
+                        "issue_token: credential rejected — it has been rotated or expired; "
+                        "obtain the new service_account_id/credential and reconfigure the client",
+                        status_code=resp.status_code,
+                    )
             raise SigilAPIError(
                 f"issue_token: expected 201, got {resp.status_code}",
                 status_code=resp.status_code,
@@ -590,7 +627,38 @@ class SigilClient:
                 f"issue_token: response body is not valid JSON (status={resp.status_code})",
                 status_code=resp.status_code,
             ) from exc
+        self._warn_if_credential_near_expiry(result)
         return result
+
+    def _warn_if_credential_near_expiry(self, result: dict[str, Any]) -> None:
+        """Emit a one-time WARNING per distinct credential expiry when a token-issue response's
+        ``credential_expires_at`` (SG-7/ENT-94c) is within ``credential_near_expiry_seconds``.
+
+        Best-effort and non-fatal: a missing/malformed field is silently ignored so a governed
+        call is never broken by this advisory path.
+        """
+        raw = result.get("credential_expires_at")
+        if not raw or not isinstance(raw, str) or raw in self._near_expiry_warned:
+            return
+        try:
+            # RFC3339 → aware datetime. Python 3.11 fromisoformat handles the trailing "Z".
+            expires = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return
+        seconds_left = (expires - datetime.now(timezone.utc)).total_seconds()
+        if seconds_left <= self.credential_near_expiry_seconds:
+            self._near_expiry_warned.add(raw)
+            # Log the normalized (re-serialized) timestamp, never the raw server string, so a
+            # rogue/MITM'd sigil-core cannot inject newlines/escape sequences into the log line.
+            # Clamp days-left at 0: an already-expired credential (accepted in observe mode) must
+            # not print a misleading negative "days left".
+            days_left = max(0.0, seconds_left / 86400.0)
+            _log.warning(
+                "sigil: agent credential is near expiry (valid until %s, ~%.1f days left); "
+                "rotate the credential before it stops working.",
+                expires.isoformat(),
+                days_left,
+            )
 
     def preflight(
         self,

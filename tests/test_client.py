@@ -11,8 +11,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from datetime import datetime, timedelta, timezone
+
 from sigil.client import _MAX_BATCH_SIZE, SigilClient
-from sigil.errors import SigilAPIError, SigilTransportError
+from sigil.errors import CredentialRotatedError, SigilAPIError, SigilTransportError
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -588,3 +590,148 @@ class TestApprovalConfigValidation:
         for bad in (float("nan"), float("inf"), 0.0):
             with pytest.raises(ValueError, match="approval_poll_interval"):
                 SigilClient(internal_token="tok", approval_poll_interval=bad)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SG-7 (ENT-94c): credential near-expiry warning + rotated-credential handling
+# ──────────────────────────────────────────────────────────────────────────────
+
+_ISSUE_OK = {
+    "grant_id": "g-1",
+    "biscuit_token": "tok",
+    "revocation_id": "r-1",
+    "expires_at": "2099-01-01T00:00:00Z",
+}
+
+
+class TestCredentialLifecycle:
+    def test_credential_rejected_raises_terminal(self, client: SigilClient) -> None:
+        """422 with code=credential_rejected → CredentialRotatedError (a terminal SigilAPIError)."""
+        resp = _mock_response(422, {"error": "…", "code": "credential_rejected"})
+        with patch.object(client._session, "post", return_value=resp):
+            with pytest.raises(CredentialRotatedError) as exc:
+                client.issue_token("a", "sa", "t", ["zep.search"], 3600)
+        assert isinstance(exc.value, SigilAPIError)  # existing handlers still catch it
+        assert exc.value.status_code == 422
+
+    def test_422_without_code_is_plain_apierror(self, client: SigilClient) -> None:
+        """A generic 422 (no credential_rejected code) stays a plain SigilAPIError."""
+        resp = _mock_response(422, {"error": "tool_allowlist exceeds task scope"})
+        with patch.object(client._session, "post", return_value=resp):
+            with pytest.raises(SigilAPIError) as exc:
+                client.issue_token("a", "sa", "t", ["zep.search"], 3600)
+        assert not isinstance(exc.value, CredentialRotatedError)
+
+    def test_near_expiry_warns(self, caplog: pytest.LogCaptureFixture) -> None:
+        c = SigilClient(internal_token="tok", credential_near_expiry_seconds=7 * 86400)
+        soon = (datetime.now(timezone.utc) + timedelta(days=3)).isoformat()
+        body = dict(_ISSUE_OK, credential_expires_at=soon)
+        with caplog.at_level("WARNING", logger="sigil"):
+            with patch.object(c._session, "post", return_value=_mock_response(201, body)):
+                c.issue_token("a", "sa", "t", ["zep.search"], 3600)
+        assert any("near expiry" in r.message for r in caplog.records)
+
+    def test_far_expiry_no_warn(self, caplog: pytest.LogCaptureFixture) -> None:
+        c = SigilClient(internal_token="tok", credential_near_expiry_seconds=7 * 86400)
+        far = (datetime.now(timezone.utc) + timedelta(days=60)).isoformat()
+        body = dict(_ISSUE_OK, credential_expires_at=far)
+        with caplog.at_level("WARNING", logger="sigil"):
+            with patch.object(c._session, "post", return_value=_mock_response(201, body)):
+                c.issue_token("a", "sa", "t", ["zep.search"], 3600)
+        assert not any("near expiry" in r.message for r in caplog.records)
+
+    def test_near_expiry_warns_once_per_timestamp(self, caplog: pytest.LogCaptureFixture) -> None:
+        c = SigilClient(internal_token="tok", credential_near_expiry_seconds=7 * 86400)
+        soon = (datetime.now(timezone.utc) + timedelta(days=3)).isoformat()
+        body = dict(_ISSUE_OK, credential_expires_at=soon)
+        with caplog.at_level("WARNING", logger="sigil"):
+            with patch.object(c._session, "post", return_value=_mock_response(201, body)):
+                c.issue_token("a", "sa", "t", ["zep.search"], 3600)
+                c.issue_token("a", "sa", "t", ["zep.search"], 3600)
+        assert sum("near expiry" in r.message for r in caplog.records) == 1
+
+    def test_no_credential_expiry_field_no_warn(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Field absent (server feature dark) → no warning, no error."""
+        c = SigilClient(internal_token="tok")
+        with caplog.at_level("WARNING", logger="sigil"):
+            with patch.object(c._session, "post", return_value=_mock_response(201, dict(_ISSUE_OK))):
+                c.issue_token("a", "sa", "t", ["zep.search"], 3600)
+        assert not any("near expiry" in r.message for r in caplog.records)
+
+    def test_422_non_json_body_is_plain_apierror(self, client: SigilClient) -> None:
+        """A 422 whose body is not JSON (e.g. a WAF/nginx HTML intercept) must fall through to a
+        plain SigilAPIError, never crash on the parse and never be treated as terminal."""
+        resp = _mock_response(422, {})
+        resp.json.side_effect = ValueError("not json")
+        with patch.object(client._session, "post", return_value=resp):
+            with pytest.raises(SigilAPIError) as exc:
+                client.issue_token("a", "sa", "t", ["zep.search"], 3600)
+        assert not isinstance(exc.value, CredentialRotatedError)
+
+    def test_already_expired_credential_warns_without_negative_days(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An already-expired credential (accepted in observe mode) warns, and the log line must
+        not contain a misleading negative 'days left'."""
+        c = SigilClient(internal_token="tok", credential_near_expiry_seconds=7 * 86400)
+        past = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+        body = dict(_ISSUE_OK, credential_expires_at=past)
+        with caplog.at_level("WARNING", logger="sigil"):
+            with patch.object(c._session, "post", return_value=_mock_response(201, body)):
+                c.issue_token("a", "sa", "t", ["zep.search"], 3600)
+        warnings = [r.message for r in caplog.records if "near expiry" in r.message]
+        assert len(warnings) == 1
+        assert "~0.0 days left" in warnings[0]
+        assert "~-" not in warnings[0]
+
+    def test_malformed_credential_expiry_safely_ignored(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A malformed credential_expires_at (e.g. a hostile server injecting a newline) fails the
+        RFC3339 parse and is silently ignored: no warning, and the governed call is never broken.
+        This is the first line of defense against log injection — the string never reaches the log."""
+        c = SigilClient(internal_token="tok", credential_near_expiry_seconds=7 * 86400)
+        body = dict(_ISSUE_OK, credential_expires_at="2099-01-01T00:00:00Z\nFORGED: fine")
+        with caplog.at_level("WARNING", logger="sigil"):
+            with patch.object(c._session, "post", return_value=_mock_response(201, body)):
+                result = c.issue_token("a", "sa", "t", ["zep.search"], 3600)
+        assert result["grant_id"] == "g-1"  # call succeeded
+        assert not any("near expiry" in r.message for r in caplog.records)
+
+    def test_near_expiry_log_uses_normalized_timestamp(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The warning must interpolate the re-serialized timestamp, never the raw server string —
+        defense-in-depth for the log line. Feed a parseable 'Z' form and confirm the log carries the
+        normalized (+00:00) representation, not the raw 'Z' string."""
+        c = SigilClient(internal_token="tok", credential_near_expiry_seconds=7 * 86400)
+        soon = datetime.now(timezone.utc) + timedelta(days=3)
+        raw = soon.isoformat().replace("+00:00", "Z")  # canonical 'Z' form
+        normalized = datetime.fromisoformat(raw.replace("Z", "+00:00")).isoformat()  # '+00:00' form
+        body = dict(_ISSUE_OK, credential_expires_at=raw)
+        with caplog.at_level("WARNING", logger="sigil"):
+            with patch.object(c._session, "post", return_value=_mock_response(201, body)):
+                c.issue_token("a", "sa", "t", ["zep.search"], 3600)
+        warnings = [r.message for r in caplog.records if "near expiry" in r.message]
+        assert len(warnings) == 1
+        assert normalized in warnings[0]
+        assert raw not in warnings[0]
+
+
+class TestCredentialNearExpiryConfigValidation:
+    def test_rejects_non_finite_or_negative(self) -> None:
+        for bad in (float("nan"), float("inf"), -1.0):
+            with pytest.raises(ValueError, match="credential_near_expiry_seconds"):
+                SigilClient(internal_token="tok", credential_near_expiry_seconds=bad)
+
+    def test_zero_is_valid(self) -> None:
+        # Zero means "always warn" — a valid, if noisy, configuration; must not raise.
+        c = SigilClient(internal_token="tok", credential_near_expiry_seconds=0.0)
+        assert c.credential_near_expiry_seconds == 0.0
+
+    def test_non_numeric_env_raises_named_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SIGIL_CREDENTIAL_NEAR_EXPIRY_SECONDS", "7d")
+        with pytest.raises(ValueError, match="SIGIL_CREDENTIAL_NEAR_EXPIRY_SECONDS"):
+            SigilClient(internal_token="tok")
