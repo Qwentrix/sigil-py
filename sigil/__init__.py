@@ -6,6 +6,7 @@ Public API surface (Pass 1 + Pass 2):
     >>> from sigil import instrumented_tool, instrumented_llm
     >>> from sigil import SigilDeniedError, SigilUnreachableDeniedError
     >>> from sigil import verify_local, VerifyResult
+    >>> from sigil import MCPToken, SigilTokenExchangeError, SigilTokenExchangeDeniedError
 
     >>> client = SigilClient(
     ...     base_url="http://sigil-core:8120",
@@ -38,6 +39,11 @@ from sigil.errors import (
     SigilTransportError,
     SigilUnreachableDeniedError,
 )
+from sigil.mcp import (
+    MCPToken,
+    SigilTokenExchangeDeniedError,
+    SigilTokenExchangeError,
+)
 from sigil.verify import VerifyResult, verify_local
 
 __all__ = [
@@ -52,9 +58,12 @@ __all__ = [
     "TERMINAL_QUARANTINE_REASONS",
     "SigilTransportError",
     "SigilAPIError",
+    "MCPToken",
+    "SigilTokenExchangeError",
+    "SigilTokenExchangeDeniedError",
     "verify_local",
     "VerifyResult",
 ]
 
 # Single source of truth — keep in sync with pyproject.toml [project] version.
-__version__ = "0.1.0"
+__version__ = "0.2.0"

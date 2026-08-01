@@ -21,11 +21,15 @@ Security notes:
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import math
 import os
+import threading
+import time
 import uuid
+from typing import NoReturn
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 from urllib.parse import quote, urlparse
@@ -36,7 +40,14 @@ from sigil._buffer import _Flusher, _LogBuffer
 from sigil._context import _current_task
 from sigil._overflow import _OverflowWriter
 from sigil._subscriber import _RevocationSubscriber
+from sigil.dpop import DPoPKey
 from sigil.errors import CredentialRotatedError, SigilAPIError, SigilTransportError
+from sigil.mcp import (
+    MCPToken,
+    SigilTokenExchangeDeniedError,
+    SigilTokenExchangeError,
+    _MCPTokenCache,
+)
 from sigil.verify import VerifyResult, verify_local
 
 if TYPE_CHECKING:
@@ -261,6 +272,8 @@ class SigilClient:
         approval_poll_interval: float = 2.0,
         credential_near_expiry_seconds: float = 604800.0,  # 7 days
         overflow_dir: str | None = None,
+        oauth_issuer: str | None = None,
+        mcp_token_leeway: float = 30.0,
     ) -> None:
         self.base_url: str = (
             base_url or os.environ.get("SIGIL_CORE_URL") or "http://sigil-core:8120"
@@ -329,6 +342,21 @@ class SigilClient:
         # by a rotated-out key that the server would deny.
         self.active_kid: str = active_kid or os.environ.get("SIGIL_BISCUIT_ACTIVE_KID") or ""
 
+        # SG-8 #393: MCP token-exchange config. oauth_issuer defaults to base_url (the
+        # /oauth/token endpoint is served on the same sigil-core echo); override when the
+        # token endpoint is fronted at a different public host — it also sets the DPoP htu.
+        self.oauth_issuer: str = (
+            oauth_issuer or os.environ.get("SIGIL_OAUTH_ISSUER") or self.base_url
+        ).rstrip("/")
+        self.mcp_token_leeway: float = float(
+            mcp_token_leeway
+            if os.environ.get("SIGIL_MCP_TOKEN_LEEWAY") is None
+            else os.environ["SIGIL_MCP_TOKEN_LEEWAY"]
+        )
+        self._mcp_cache = _MCPTokenCache()
+        self._dpop_key: DPoPKey | None = None
+        self._dpop_lock = threading.Lock()
+
         if self.fail_mode not in ("closed", "open"):
             raise ValueError("fail_mode must be 'closed' or 'open'")
         if self.kill_switch_fail_mode not in ("closed", "open"):
@@ -341,6 +369,10 @@ class SigilClient:
             raise ValueError("approval_poll_interval must be a finite number > 0")
         if not math.isfinite(self.credential_near_expiry_seconds) or self.credential_near_expiry_seconds < 0:
             raise ValueError("credential_near_expiry_seconds must be a finite number >= 0")
+        # A NaN leeway would make the cache freshness test always False (mint every call); a
+        # negative one would serve tokens right up to expiry. Match the other numeric guards.
+        if not math.isfinite(self.mcp_token_leeway) or self.mcp_token_leeway < 0:
+            raise ValueError("mcp_token_leeway must be a finite number >= 0")
         if not self._internal_token:
             raise ValueError(
                 "internal_token is required. " "Pass it directly or set SIGIL_SDK_TOKEN."
@@ -357,6 +389,20 @@ class SigilClient:
                 "use https:// in production.",
                 self.base_url,
             )
+        # Same check for oauth_issuer when it diverges from base_url: mcp_token() sends the
+        # agent Biscuit (the credential) to {oauth_issuer}/oauth/token, so a plaintext public
+        # issuer would leak it. (When it equals base_url the check above already covered it.)
+        if self.oauth_issuer != self.base_url:
+            _parsed_issuer = urlparse(self.oauth_issuer)
+            if _parsed_issuer.scheme == "http" and _parsed_issuer.hostname not in (
+                "localhost",
+                "127.0.0.1",
+            ):
+                _log.warning(
+                    "sigil: oauth_issuer %r uses http:// with non-localhost host; the Biscuit "
+                    "subject_token will be sent in plaintext. Use https:// in production.",
+                    self.oauth_issuer,
+                )
 
         # Loud warning for fail_mode=open — must be explicit, never the default.
         if self.fail_mode == "open":
@@ -629,6 +675,144 @@ class SigilClient:
             ) from exc
         self._warn_if_credential_near_expiry(result)
         return result
+
+    def _get_dpop_key(self) -> DPoPKey:
+        with self._dpop_lock:
+            if self._dpop_key is None:
+                self._dpop_key = DPoPKey()
+            return self._dpop_key
+
+    def mcp_token(
+        self,
+        resource: str,
+        *,
+        scope: list[str] | None = None,
+        dpop: bool = False,
+        subject_token: str | None = None,
+    ) -> MCPToken:
+        """Exchange the agent Biscuit for a short-lived MCP access token.
+
+        POST {oauth_issuer}/oauth/token (RFC 8693, unauthenticated — the Biscuit is the
+        credential). The Biscuit is taken from ``subject_token`` or, when omitted, from the
+        current ``client.task(...)`` context. Results are cached per (resource, scope, dpop)
+        until ``mcp_token_leeway`` seconds before expiry.
+
+        Args:
+            resource: the target MCP tool's registered resource_url (RFC 8707).
+            scope: requested scopes (downscoped server-side to biscuit ∩ tool.allowed).
+            dpop: request a DPoP-bound token; the result exposes ``proof_for(htu, htm)``.
+            subject_token: explicit Biscuit override (else the current task's Biscuit).
+
+        Returns:
+            MCPToken.
+
+        Raises:
+            ValueError: no Biscuit available.
+            SigilTokenExchangeError / SigilTokenExchangeDeniedError: an RFC 6749 error.
+            SigilTransportError: network failure.
+            SigilAPIError: an unexpected non-200 with no error object, or bad JSON.
+        """
+        biscuit = subject_token
+        if biscuit is None:
+            task = _current_task.get()
+            biscuit = getattr(task, "_biscuit_token", None) if task is not None else None
+        if not biscuit:
+            raise ValueError(
+                "mcp_token: no agent biscuit — call inside client.task(...) or pass subject_token"
+            )
+        # Fingerprint (not the Biscuit itself) partitions the cache per-agent so two callers with
+        # different subject_tokens for the same resource/scope/dpop never share a token.
+        biscuit_fp = hashlib.sha256(biscuit.encode("utf-8")).hexdigest()[:32]
+        key = _MCPTokenCache.key(biscuit_fp, resource, scope, dpop)
+        return self._mcp_cache.get_or_mint(
+            key,
+            now=time.time(),
+            leeway=self.mcp_token_leeway,
+            mint=lambda: self._mint_mcp_token(biscuit, resource, scope, dpop),
+        )
+
+    def _mint_mcp_token(
+        self, biscuit: str, resource: str, scope: list[str] | None, dpop: bool
+    ) -> MCPToken:
+        url = f"{self.oauth_issuer}/oauth/token"
+        data: dict[str, str] = {
+            "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+            "subject_token_type": "urn:qwentrix:biscuit",
+            "subject_token": biscuit,
+            "resource": resource,
+        }
+        if scope:
+            data["scope"] = " ".join(scope)
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        dpop_key: DPoPKey | None = None
+        if dpop:
+            dpop_key = self._get_dpop_key()
+            headers["DPoP"] = dpop_key.proof(url, "POST")
+
+        try:
+            # allow_redirects=False: a 307/308 would re-send this POST body — which carries the
+            # Biscuit (the credential) — to the redirect target. On an UNAUTHENTICATED endpoint that
+            # is a credential-exfiltration vector, so never follow a redirect here; treat it as an error.
+            resp = self._session.post(
+                url, headers=headers, data=data, timeout=self.timeout, allow_redirects=False
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise SigilTransportError(
+                "mcp_token: transport error reaching oauth endpoint", method="POST", url=url
+            ) from exc
+
+        if resp.is_redirect:
+            raise SigilAPIError(
+                f"mcp_token: unexpected redirect ({resp.status_code}) from oauth endpoint",
+                status_code=resp.status_code,
+            )
+        if resp.status_code != 200:
+            self._raise_token_exchange_error(resp)
+
+        try:
+            body = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            raise SigilAPIError(
+                "mcp_token: response is not valid JSON", status_code=resp.status_code
+            ) from exc
+
+        access_token = str(body.get("access_token") or "")
+        if not access_token:
+            raise SigilAPIError("mcp_token: response missing access_token", status_code=resp.status_code)
+        # A non-positive expires_in would make expires_at ≈ now, so every subsequent call would
+        # treat the cached token as stale and re-mint — reject it as a malformed response.
+        raw_expires_in = body.get("expires_in")
+        if not isinstance(raw_expires_in, (int, float)) or isinstance(raw_expires_in, bool) or raw_expires_in <= 0:
+            raise SigilAPIError(
+                f"mcp_token: invalid expires_in {raw_expires_in!r}", status_code=resp.status_code
+            )
+        expires_in = int(raw_expires_in)
+        scope_str = str(body.get("scope") or "")
+        return MCPToken(
+            access_token=access_token,
+            token_type=str(body.get("token_type") or "Bearer"),
+            scope=scope_str.split() if scope_str else [],
+            expires_in=expires_in,
+            expires_at=time.time() + expires_in,
+            resource=resource,
+            _dpop=dpop_key,
+        )
+
+    def _raise_token_exchange_error(self, resp: requests.Response) -> NoReturn:
+        code, desc = "", ""
+        try:
+            body = resp.json()
+            if isinstance(body, dict):
+                code = str(body.get("error") or "")
+                desc = str(body.get("error_description") or "")
+        except Exception:  # noqa: BLE001
+            pass
+        status = getattr(resp, "status_code", 0)
+        if not code:
+            raise SigilAPIError(f"mcp_token: unexpected status {status}", status_code=status)
+        if code == "access_denied":
+            raise SigilTokenExchangeDeniedError(code, desc, status_code=status)
+        raise SigilTokenExchangeError(code, desc, status_code=status)
 
     def _warn_if_credential_near_expiry(self, result: dict[str, Any]) -> None:
         """Emit a one-time WARNING per distinct credential expiry when a token-issue response's
