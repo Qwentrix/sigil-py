@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -40,7 +41,11 @@ class _OverflowWriter:
         self._dir: str = (
             overflow_dir or os.environ.get("SIGIL_OVERFLOW_DIR") or _DEFAULT_OVERFLOW_DIR
         )
-        self._agent_id: str = agent_id or "unknown"
+        # Sanitize the agent id so a hostile/misconfigured SIGIL_AGENT_ID (e.g. "../../etc/x"
+        # or an absolute path) cannot escape self._dir via os.path.join in _current_path.
+        # Mirrors the TS SDK (sigil-sdk/src/overflow.ts). Prompt-log overflow now carries
+        # DLP-redacted samples, so a traversal must not write them outside the overflow dir.
+        self._agent_id: str = re.sub(r"[^A-Za-z0-9_-]", "_", agent_id or "unknown")
         self._writable: bool = self._init_dir()
         # F5: count dropped events so host applications can observe overflow-full
         # conditions and alert.  Exposed via the drop_count property.
@@ -137,6 +142,10 @@ class _OverflowWriter:
             self._replay_file(os.path.join(self._dir, filename), client)
 
     def _replay_file(self, path: str, client: SigilClient) -> None:
+        # SG-9 SP-1: overflow files may hold both tool-invocation events (→ log_batch) and
+        # prompt-log events (→ log_prompt). Route each kind to its own endpoint; a prompt-log
+        # replayed through log_batch would be a malformed tool event.
+        from sigil._buffer import _partition_events, _send_prompt_log
         from sigil.errors import SigilAPIError, SigilTransportError
 
         try:
@@ -159,13 +168,23 @@ class _OverflowWriter:
             except json.JSONDecodeError:
                 continue  # skip corrupt lines
 
+        tool_events, prompt_events = _partition_events(events)
+
         all_ok = True
-        for i in range(0, len(events), 100):
+        for i in range(0, len(tool_events), 100):
             try:
-                client.log_batch(events[i : i + 100])
+                client.log_batch(tool_events[i : i + 100])
             except (SigilTransportError, SigilAPIError):
                 all_ok = False
                 break  # leave file for next successful connection
+
+        if all_ok:
+            for ev in prompt_events:
+                try:
+                    _send_prompt_log(client, ev)
+                except (SigilTransportError, SigilAPIError):
+                    all_ok = False
+                    break  # leave file for next successful connection
 
         if all_ok:
             try:

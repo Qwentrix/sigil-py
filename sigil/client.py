@@ -41,7 +41,12 @@ from sigil._context import _current_task
 from sigil._overflow import _OverflowWriter
 from sigil._subscriber import _RevocationSubscriber
 from sigil.dpop import DPoPKey
-from sigil.errors import CredentialRotatedError, SigilAPIError, SigilTransportError
+from sigil.errors import (
+    CredentialRotatedError,
+    SigilAPIError,
+    SigilDeniedError,
+    SigilTransportError,
+)
 from sigil.mcp import (
     MCPToken,
     SigilTokenExchangeDeniedError,
@@ -210,6 +215,51 @@ class SigilTaskContext:
     def task_id(self) -> str | None:
         """UUID of the open task, or None before entry."""
         return self._task_id
+
+    @property
+    def effective_agent_id(self) -> str:
+        """The agent this task runs as: per-task override ?? client default.
+
+        This is the agent the task's biscuit was issued for (see __enter__), so audit/prompt
+        attribution must use THIS — not ``client.agent_id`` — or sigil-core rejects the row when a
+        per-task agent override is set (the server enforces agent_id == the task's owning agent).
+        Mirrors the TS SDK's ``effectiveAgentId``.
+        """
+        return self._agent_id_override or self._client.agent_id
+
+    def handoff(
+        self,
+        child_agent_id: str,
+        scope_delta: dict[str, Any],
+        *,
+        child_task_id: str | None = None,
+        authorized_by_user_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Record an agent handoff from THIS task to *child_agent_id* (SG-9 SP-1 / ENT-91).
+
+        Parent task + agent are taken from this active context (never client-supplied). The child
+        task is the caller's to create; if *child_task_id* is omitted a fresh UUID is generated and
+        returned so the caller can open the child agent's task with it.
+
+        Returns ``{"handoff_id": ..., "child_task_id": ...}``.
+        """
+        if self._task_id is None:
+            raise SigilDeniedError(
+                "handoff() requires an active task (use 'with client.task([...]) as task:')",
+                denied_reason="no_task",
+                tool_name="handoff",
+                task_id="",
+            )
+        child_task = child_task_id or str(uuid.uuid4())
+        result = self._client.record_handoff(
+            parent_task_id=self._task_id,
+            parent_agent_id=self.effective_agent_id,
+            child_agent_id=child_agent_id,
+            child_task_id=child_task,
+            scope_delta=scope_delta,
+            authorized_by_user_id=authorized_by_user_id,
+        )
+        return {"handoff_id": result.get("handoff_id"), "child_task_id": child_task}
 
     # _biscuit_token is intentionally NOT exposed — it must never appear in
     # logs, error messages, or external interfaces.
@@ -1109,6 +1159,159 @@ class SigilClient:
         except Exception as exc:  # noqa: BLE001
             raise SigilAPIError(
                 f"log_batch: response body is not valid JSON (status={resp.status_code})",
+                status_code=resp.status_code,
+            ) from exc
+        return result
+
+    def log_prompt(
+        self,
+        task_id: str,
+        agent_id: str,
+        *,
+        prompt_hash: str,
+        prompt_redacted: dict[str, Any],
+        response_hash: str,
+        response_sampled: Any,
+        model: str,
+        model_provider: str,
+        token_count_input: int = 0,
+        token_count_output: int = 0,
+        latency_ms: int | None = None,
+    ) -> dict[str, Any]:
+        """Write one prompt-log row to sigil-core (SG-9 SP-1 / ENT-91 Task Replay prompt lane).
+
+        ``POST {base}/internal/v1/sigil/tasks/{task_id}/log-prompt``  (returns 202)
+
+        Unlike :meth:`log_batch` (a homogeneous batch of tool-invocation events to a single
+        toolgate endpoint), a prompt-log targets a per-task endpoint and is far lower-volume
+        (one per governed LLM call, not one per tool op), so it is sent directly rather than
+        through the audit buffer. The ``@instrumented_llm`` decorator calls this **best-effort**:
+        a failure here never breaks the governed call, because the tool-invocation audit event
+        remains the authoritative record.
+
+        Tenant identity is carried by the internalauth headers (``X-Tenant-ID``); ``task_id`` is
+        the path. Raw prompt/response text is NEVER sent — only ``prompt_hash``/``response_hash``
+        and the DLP-redacted ``prompt_redacted``/``response_sampled`` samples.
+
+        Args:
+            task_id: The active task's UUID (path scope).
+            agent_id: The calling agent's UUID (bound on the row).
+            prompt_hash: SHA-256 hex of the original prompt text (64 chars).
+            prompt_redacted: DLP-scrubbed copy of the call arguments.
+            response_hash: SHA-256 hex of the response text (64 chars).
+            response_sampled: DLP-scrubbed, truncated response sample (JSON-serialisable).
+            model: Concrete model id when known (e.g. ``"gpt-4o"``), else a coarse label.
+            model_provider: Provider namespace (e.g. ``"openai"``).
+            token_count_input: Prompt-side token count (0 when the SDK cannot derive it).
+            token_count_output: Completion-side token count (0 when unknown).
+            latency_ms: Wall-clock latency of the governed LLM call, if measured.
+
+        Returns:
+            dict — sigil-core's acknowledgement body.
+
+        Raises:
+            :class:`~sigil.errors.SigilTransportError`: On network failure.
+            :class:`~sigil.errors.SigilAPIError`: On a non-202 status or non-JSON body.
+        """
+        # quote task_id — defence-in-depth path-injection guard (mirrors approval_status).
+        safe_task = quote(task_id, safe="")
+        url = f"{self.base_url}/internal/v1/sigil/tasks/{safe_task}/log-prompt"
+        body: dict[str, Any] = {
+            "agent_id": agent_id,
+            "prompt_hash": prompt_hash,
+            "prompt_redacted": prompt_redacted,
+            "response_hash": response_hash,
+            "response_sampled": response_sampled,
+            "model": model,
+            "model_provider": model_provider,
+            "token_count_input": token_count_input,
+            "token_count_output": token_count_output,
+            "latency_ms": latency_ms,
+        }
+
+        try:
+            resp = self._session.post(
+                url,
+                headers=self._toolgate_headers(),
+                json=body,
+                timeout=self.timeout,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise SigilTransportError(
+                "log_prompt: transport error reaching sigil-core",
+                method="POST",
+                url=url,
+            ) from exc
+
+        if resp.status_code != 202:
+            raise SigilAPIError(
+                f"log_prompt: expected 202, got {resp.status_code}",
+                status_code=resp.status_code,
+            )
+
+        try:
+            result: dict[str, Any] = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            raise SigilAPIError(
+                f"log_prompt: response body is not valid JSON (status={resp.status_code})",
+                status_code=resp.status_code,
+            ) from exc
+        return result
+
+    def record_handoff(
+        self,
+        *,
+        parent_task_id: str,
+        parent_agent_id: str,
+        child_agent_id: str,
+        child_task_id: str,
+        scope_delta: dict[str, Any],
+        authorized_by_user_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Record an agent handoff (SG-9 SP-1 / ENT-91 Task-Replay handoff lane).
+
+        ``POST {base}/internal/v1/sigil/handoffs`` (returns 201). Records the handoff EVENT only —
+        parent task/agent identify the spawning task; the child task is created by the caller
+        out-of-band. Tenant is carried by the internalauth headers, never the body. Prefer
+        :meth:`SigilTaskContext.handoff`, which fills parent task/agent from the active context.
+        """
+        url = f"{self.base_url}/internal/v1/sigil/handoffs"
+        body: dict[str, Any] = {
+            "parent_task_id": parent_task_id,
+            "parent_agent_id": parent_agent_id,
+            "child_agent_id": child_agent_id,
+            "child_task_id": child_task_id,
+            "scope_delta": scope_delta,
+        }
+        if authorized_by_user_id:
+            body["authorized_by_user_id"] = authorized_by_user_id
+
+        # _toolgate_headers() is reused for its X-Tenant-ID + internalauth bundle; the extra
+        # X-Sigil-Agent-ID it adds is harmless here (the /handoffs route is its own group, not the
+        # rate-limited toolgate group), and carrying the acting agent is useful for attribution.
+        try:
+            resp = self._session.post(
+                url,
+                headers=self._toolgate_headers(),
+                json=body,
+                timeout=self.timeout,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise SigilTransportError(
+                "record_handoff: transport error reaching sigil-core",
+                method="POST",
+                url=url,
+            ) from exc
+        if resp.status_code != 201:
+            raise SigilAPIError(
+                f"record_handoff: expected 201, got {resp.status_code}",
+                status_code=resp.status_code,
+            )
+        try:
+            result: dict[str, Any] = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            raise SigilAPIError(
+                f"record_handoff: response body is not valid JSON (status={resp.status_code})",
                 status_code=resp.status_code,
             ) from exc
         return result
