@@ -99,3 +99,17 @@ class SigilAPIError(Exception):
     def __init__(self, message: str, *, status_code: int = 0) -> None:
         super().__init__(message)
         self.status_code: int = status_code
+
+
+class CredentialRotatedError(SigilAPIError):
+    """Raised when token issuance is rejected because the agent's credential is no
+    longer valid (SG-7/ENT-94c) — it has been ROTATED past its grace window or has
+    EXPIRED under enforcement. sigil-core returns HTTP 422 with ``code`` ==
+    ``"credential_rejected"``.
+
+    Subclasses :class:`SigilAPIError` so existing ``except SigilAPIError`` handlers
+    keep working, but it is a **distinct, terminal** type: retrying with the same
+    ``service_account_id`` / credential will keep being rejected. The operator must
+    obtain the newly-rotated credential (new ``service_account_id`` + secret) and
+    reconfigure the client. A retry/backoff wrapper should recognise it and STOP.
+    """

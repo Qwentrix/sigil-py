@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
 import inspect
 import logging
 import math
@@ -52,6 +53,7 @@ import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, NoReturn, TypeVar
 
+from sigil._buffer import _KIND_KEY, _PROMPT_LOG_KIND
 from sigil._context import _current_task
 from sigil.errors import (
     TERMINAL_QUARANTINE_REASONS,
@@ -61,7 +63,7 @@ from sigil.errors import (
     SigilTransportError,
     SigilUnreachableDeniedError,
 )
-from sigil.redaction import args_hash, redact_safe
+from sigil.redaction import args_hash, canonical_json, redact_safe
 from sigil.verify import verify_local
 
 if TYPE_CHECKING:
@@ -795,6 +797,177 @@ async def _redeem_approval_async(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# SG-9 SP-1 (ENT-91): Task-Replay prompt-log lane (@instrumented_llm enrichment)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Chars of the response kept in the DLP-scrubbed sample. Bounds the buffered/overflowed
+# event size; the full response is never stored (only its hash + this redacted head).
+_RESPONSE_SAMPLE_MAX: int = 2000
+# Chars of serialized prompt_redacted kept — bounds prompt_redacted the same way
+# _RESPONSE_SAMPLE_MAX bounds the response sample (a single log-prompt is one DB row per
+# LLM call, so an unbounded redacted-args payload would inflate buffer/overflow/DB storage).
+_PROMPT_REDACTED_MAX: int = 4000
+
+
+def _extract_response_text(result: Any) -> str:
+    """Best-effort string form of an LLM result for hashing + sampling. Never raises.
+
+    Handles the common return shapes (OpenAI-style ``choices[0].message.content`` /
+    ``choices[0].text``, a bare ``str``, dicts) and falls back to ``str(result)`` so the
+    prompt lane still gets a stable hash even for an unrecognised SDK response object.
+    """
+    if result is None:
+        return ""  # a legit None result → empty response, not the literal string "None"
+    try:
+        choices = getattr(result, "choices", None)
+        if choices is None and isinstance(result, dict):
+            choices = result.get("choices")
+        if choices:
+            first = choices[0]
+            msg = getattr(first, "message", None)
+            if msg is None and isinstance(first, dict):
+                msg = first.get("message")
+            content = getattr(msg, "content", None)
+            if content is None and isinstance(msg, dict):
+                content = msg.get("content")
+            if isinstance(content, str):
+                return content
+            text = getattr(first, "text", None)
+            if text is None and isinstance(first, dict):
+                text = first.get("text")
+            if isinstance(text, str):
+                return text
+        if isinstance(result, str):
+            return result
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return str(result)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _extract_tokens(result: Any) -> tuple[int, int]:
+    """Best-effort ``(prompt_tokens, completion_tokens)`` from an LLM result. Never raises.
+
+    Reads the OpenAI-style ``usage`` object/dict when present; returns ``(0, 0)`` when the
+    result carries no recognisable usage (the columns are nullable-defaulting-to-0, so 0
+    honestly signals "not reported by the provider").
+    """
+    try:
+        usage = getattr(result, "usage", None)
+        if usage is None and isinstance(result, dict):
+            usage = result.get("usage")
+        if usage is not None:
+
+            def _g(obj: Any, key: str) -> int:
+                v = getattr(obj, key, None)
+                if v is None and isinstance(obj, dict):
+                    v = obj.get(key)
+                return int(v) if isinstance(v, (int, float)) else 0
+
+            return _g(usage, "prompt_tokens"), _g(usage, "completion_tokens")
+    except Exception:  # noqa: BLE001
+        pass
+    return 0, 0
+
+
+def _resolve_model(explicit: str | None, name: str, kwargs: dict[str, Any], result: Any) -> str:
+    """Resolve the concrete model id for the prompt-log row (never empty — the column is NOT NULL).
+
+    Precedence: an explicit ``model=`` on ``@instrumented_llm`` > the call's ``model=`` kwarg
+    (the near-universal LLM SDK convention) > the result object's ``.model`` > the decorator
+    tool ``name`` as a coarse fallback. Best-effort; never raises.
+    """
+    if explicit:
+        return explicit
+    m = kwargs.get("model")
+    if isinstance(m, str) and m:
+        return m
+    try:
+        rm = getattr(result, "model", None)
+        if rm is None and isinstance(result, dict):
+            rm = result.get("model")
+        if isinstance(rm, str) and rm:
+            return rm
+    except Exception:  # noqa: BLE001
+        pass
+    return name
+
+
+def _build_prompt_log_event(
+    *,
+    task_id: str,
+    agent_id: str,
+    namespace: str,
+    tool_name: str,
+    explicit_model: str | None,
+    prompt_text: str,
+    prompt_redacted: Any,
+    result: Any,
+    latency_ms: int,
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the buffered prompt-log event for the Task-Replay prompt lane.
+
+    Carries hashes + DLP-redacted samples ONLY (never raw prompt/response text). Tagged with
+    the buffer discriminator so :class:`~sigil._buffer._Flusher` routes it to ``log_prompt``.
+    """
+    response_text = _extract_response_text(result)
+    token_in, token_out = _extract_tokens(result)
+    # Redact a margin window BEFORE truncating so a DLP pattern straddling the cut is still
+    # scrubbed (the response_hash is over the full text; only this sample is bounded).
+    redacted_sample = redact_safe({"text": response_text[: _RESPONSE_SAMPLE_MAX * 2]})
+    sample_text = redacted_sample.get("text", "")[:_RESPONSE_SAMPLE_MAX]
+    # Bound prompt_redacted's serialized size (already DLP-scrubbed; just size-capped).
+    pr: Any = prompt_redacted if isinstance(prompt_redacted, dict) else {"args": prompt_redacted}
+    pr_json = canonical_json(pr)
+    if len(pr_json) > _PROMPT_REDACTED_MAX:
+        pr = {"_truncated": True, "preview": pr_json[:_PROMPT_REDACTED_MAX]}
+    return {
+        _KIND_KEY: _PROMPT_LOG_KIND,
+        "task_id": task_id,
+        "agent_id": agent_id,
+        "prompt_hash": hashlib.sha256(prompt_text.encode("utf-8")).hexdigest(),
+        "prompt_redacted": pr,
+        "response_hash": hashlib.sha256(response_text.encode("utf-8")).hexdigest(),
+        "response_sampled": {"text": sample_text},
+        "model": _resolve_model(explicit_model, tool_name, kwargs, result),
+        "model_provider": namespace,
+        "token_count_input": token_in,
+        "token_count_output": token_out,
+        "latency_ms": latency_ms,
+    }
+
+
+def _enqueue_prompt_log(
+    client: SigilClient,
+    prompt_log_ctx: dict[str, Any],
+    *,
+    task_id: str,
+    agent_id: str,
+    result: Any,
+    latency_ms: int,
+) -> None:
+    """Build + buffer one prompt-log event. Best-effort: never raises into the governed call.
+
+    Pushed onto the SAME ring buffer as tool events, so it is non-blocking on both the sync and
+    async paths and inherits the buffer's durability (overflow-backed + drained on close).
+    """
+    try:
+        ev = _build_prompt_log_event(
+            task_id=task_id,
+            agent_id=agent_id,
+            result=result,
+            latency_ms=latency_ms,
+            **prompt_log_ctx,
+        )
+        client._log_buffer.push(ev)
+    except Exception:  # noqa: BLE001 — enrichment lane; a failure here must not affect the call
+        _log.debug("sigil: prompt-log build/enqueue failed (task_id=%s)", task_id, exc_info=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # I-3: shared execute+audit helpers (extracted from the 4-way inline shell)
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -815,14 +988,21 @@ def _execute_audit(
     args_redacted: Any,
     approval_grant_id: str | None = None,
     prompt_entropy: float = 0.0,
+    prompt_log_ctx: dict[str, Any] | None = None,
 ) -> Any:
     """Execute *fn* synchronously, time it, and emit one audit event in all cases.
 
     The ``try/finally`` guarantees the audit event is emitted even when *fn*
     raises, producing ``outcome="error"`` instead of ``outcome="allowed"``.
+
+    When *prompt_log_ctx* is supplied (``@instrumented_llm`` only) and the call
+    succeeded, an additive prompt-log event is also buffered (SG-9 SP-1). It is
+    enrichment on top of the tool-invocation event above and is emitted only on
+    success — a prompt-log needs a real response.
     """
     t0 = time.monotonic()
     outcome = "allowed"
+    result: Any = None
     try:
         result = fn(*args, **kwargs)
         return result
@@ -846,6 +1026,11 @@ def _execute_audit(
             prompt_entropy=prompt_entropy,
         )
         client._log_buffer.push(ev)
+        if prompt_log_ctx is not None and outcome == "allowed":
+            _enqueue_prompt_log(
+                client, prompt_log_ctx,
+                task_id=task_id, agent_id=agent_id, result=result, latency_ms=latency_ms,
+            )
 
 
 async def _async_execute_audit(
@@ -864,12 +1049,19 @@ async def _async_execute_audit(
     args_redacted: Any,
     approval_grant_id: str | None = None,
     prompt_entropy: float = 0.0,
+    prompt_log_ctx: dict[str, Any] | None = None,
 ) -> Any:
-    """Async variant of ``_execute_audit`` — awaits *fn* and emits audit in finally."""
+    """Async variant of ``_execute_audit`` — awaits *fn* and emits audit in finally.
+
+    The additive prompt-log (when *prompt_log_ctx* is supplied) is enqueued on the same
+    ring buffer via a non-blocking ``push`` — no executor offload is needed because the
+    push does no I/O; the background flusher thread performs the network delivery.
+    """
     t0 = time.monotonic()
     outcome = "allowed"
+    result: Any = None
     try:
-        result: Any = await fn(*args, **kwargs)
+        result = await fn(*args, **kwargs)
         return result
     except BaseException:
         outcome = "error"
@@ -891,6 +1083,11 @@ async def _async_execute_audit(
             prompt_entropy=prompt_entropy,
         )
         client._log_buffer.push(ev)
+        if prompt_log_ctx is not None and outcome == "allowed":
+            _enqueue_prompt_log(
+                client, prompt_log_ctx,
+                task_id=task_id, agent_id=agent_id, result=result, latency_ms=latency_ms,
+            )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -952,7 +1149,7 @@ def instrumented_tool(
                 # ── Step 1: require active task context ───────────────────────
                 task = _require_task(tool_fqn)
                 client: SigilClient = task._client
-                agent_id: str = client.agent_id
+                agent_id: str = task.effective_agent_id
                 task_id: str = task.task_id or ""
 
                 raw = _raw_args(args, kwargs)
@@ -1036,7 +1233,7 @@ def instrumented_tool(
             # ── Step 1: require active task context ───────────────────────────
             task = _require_task(tool_fqn)
             client: SigilClient = task._client
-            agent_id: str = client.agent_id
+            agent_id: str = task.effective_agent_id
             task_id: str = task.task_id or ""
 
             raw = _raw_args(args, kwargs)
@@ -1117,6 +1314,7 @@ def instrumented_llm(
     namespace: str,
     name: str,
     risk_tier: str = "low",
+    model: str | None = None,
 ) -> Callable[[F], F]:
     """Decorator that instruments an LLM call with Sigil governance + DLP.
 
@@ -1124,7 +1322,7 @@ def instrumented_llm(
     :func:`instrumented_tool`, including the ``run_in_executor`` offload for
     high/critical preflight — see that decorator's note for details).
 
-    Identical to :func:`instrumented_tool` with two additions:
+    Identical to :func:`instrumented_tool` with these additions:
 
     * ``args_redacted`` — DLP-scrubbed copy of the call arguments is included
       in the buffered audit event (PII → ``<PII:TYPE>`` placeholders).
@@ -1132,11 +1330,22 @@ def instrumented_llm(
       degrades gracefully instead of breaking the tool call.
     * ``args_hash`` — computed over the **original, unredacted** args so that
       sigil-core can verify argument integrity without storing sensitive data.
+    * **Prompt-log lane (SG-9 SP-1 / ENT-91)** — on a *successful* call an
+      additive prompt-log event is buffered alongside the tool-invocation event:
+      ``prompt_hash``/``response_hash`` + DLP-redacted samples, ``model`` /
+      ``model_provider`` (=``namespace``), best-effort token counts, and
+      ``latency_ms``. This feeds the Task-Replay prompt lane and is enrichment
+      on top of the authoritative tool-invocation event — a failure to emit it
+      never affects the governed call. Raw prompt/response text is never stored.
 
     Args:
-        namespace: Tool namespace, e.g. ``"openai"``.
+        namespace: Tool namespace, e.g. ``"openai"``. Also used as
+            ``model_provider`` on the prompt-log row.
         name: Tool name, e.g. ``"chat"``.
         risk_tier: Risk classification (default ``"low"``).
+        model: Concrete model id for the prompt-log row (e.g. ``"gpt-4o"``). When
+            omitted, the SDK derives it best-effort from the call's ``model=``
+            kwarg, then the result object's ``.model``, then falls back to *name*.
 
     Returns:
         Decorator that wraps the target callable (sync or async preserved).
@@ -1162,7 +1371,7 @@ def instrumented_llm(
                 # ── Step 1: require active task context ───────────────────────
                 task = _require_task(tool_fqn)
                 client: SigilClient = task._client
-                agent_id: str = client.agent_id
+                agent_id: str = task.effective_agent_id
                 task_id: str = task.task_id or ""
 
                 raw = _raw_args(args, kwargs)
@@ -1171,7 +1380,17 @@ def instrumented_llm(
 
                 # SG-5: extract prompt text using the robust helper (handles str,
                 # messages-list, and kwarg calling conventions) then compute entropy.
-                entropy = _shannon_entropy(_extract_prompt(args, kwargs))
+                # SG-9 SP-1: the same extracted text feeds the prompt-log lane below.
+                prompt_text = _extract_prompt(args, kwargs)
+                entropy = _shannon_entropy(prompt_text)
+                prompt_log_ctx = {
+                    "namespace": namespace,
+                    "tool_name": name,
+                    "explicit_model": model,
+                    "prompt_text": prompt_text,
+                    "prompt_redacted": redacted,
+                    "kwargs": kwargs,
+                }
 
                 # ── Steps 2-4: governance offloaded to thread (I-1) ───────────
                 fail_open, approval_id = await asyncio.get_running_loop().run_in_executor(
@@ -1239,6 +1458,7 @@ def instrumented_llm(
                     args_redacted=redacted,
                     approval_grant_id=approval_grant_id,
                     prompt_entropy=entropy,
+                    prompt_log_ctx=prompt_log_ctx,
                 )
 
             return async_wrapper  # type: ignore[return-value]
@@ -1248,7 +1468,7 @@ def instrumented_llm(
             # ── Step 1: require active task context ───────────────────────────
             task = _require_task(tool_fqn)
             client: SigilClient = task._client
-            agent_id: str = client.agent_id
+            agent_id: str = task.effective_agent_id
             task_id: str = task.task_id or ""
 
             raw = _raw_args(args, kwargs)
@@ -1257,7 +1477,17 @@ def instrumented_llm(
 
             # SG-5: extract prompt text using the robust helper (handles str,
             # messages-list, and kwarg calling conventions) then compute entropy.
-            entropy = _shannon_entropy(_extract_prompt(args, kwargs))
+            # SG-9 SP-1: the same extracted text feeds the prompt-log lane below.
+            prompt_text = _extract_prompt(args, kwargs)
+            entropy = _shannon_entropy(prompt_text)
+            prompt_log_ctx = {
+                "namespace": namespace,
+                "tool_name": name,
+                "explicit_model": model,
+                "prompt_text": prompt_text,
+                "prompt_redacted": redacted,
+                "kwargs": kwargs,
+            }
 
             # ── Steps 2-4: governance (shared helper) ─────────────────────────
             fail_open, approval_id = _governance_check(
@@ -1319,6 +1549,7 @@ def instrumented_llm(
                 args_redacted=redacted,
                 approval_grant_id=approval_grant_id,
                 prompt_entropy=entropy,
+                prompt_log_ctx=prompt_log_ctx,
             )
 
         return wrapper  # type: ignore[return-value]
